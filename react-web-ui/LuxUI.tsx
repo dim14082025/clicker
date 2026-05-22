@@ -1194,7 +1194,10 @@ function MiningScreen({
   setLuxBal: (n: number) => void;
   openWalletModal: () => void;
 }) {
-  const [subTab, setSubTab]               = useState<"owned" | "shop">("owned");
+  // Default to Marketplace when no wallet — gives newcomers something to browse
+  // immediately, matching the Replit reference layout. We switch back to Owned
+  // NFTs once a wallet is connected and the user actually owns miners.
+  const [subTab, setSubTab]               = useState<"owned" | "shop">(eoaAddr ? "owned" : "shop");
   const persistEoa = setEoaAddr;
   const [miners, setMiners]               = useState<MinerGrp[]>([]);
   const [listings, setListings]           = useState<Listing[]>([]);
@@ -1222,7 +1225,14 @@ function MiningScreen({
   // If the wallet was just connected (null → addr), default the marketplace tab
   // to "shop" so the user can browse — switched back to "owned" if NFTs exist.
   useEffect(() => {
-    if (!eoaAddr) { setMiners([]); prevEoaRef.current = null; return; }
+    if (!eoaAddr) {
+      setMiners([]);
+      prevEoaRef.current = null;
+      // No wallet: force Marketplace as the visible tab so the user always sees
+      // the miner catalog (matches Replit reference).
+      setSubTab("shop");
+      return;
+    }
     const justConnected = prevEoaRef.current !== eoaAddr;
     prevEoaRef.current = eoaAddr;
     const addr = eoaAddr;
