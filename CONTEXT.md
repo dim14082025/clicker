@@ -624,6 +624,110 @@ react-web-ui/
 
 ---
 
+## 13-B. ИСПРАВЛЕНИЯ МАЙ 2026 (Devin session — Profile / Tasks / Backend sync)
+
+Сессия Devin продолжила работу над `react-web-ui/LuxUI.tsx`. Ветка
+`devin/1778748639-profile-tasks-features`, PR
+`https://github.com/dim14082025/clicker/pull/1` (форк, т.к. у этого
+аккаунта нет write-доступа к `aliter230880/clicker`). Три коммита поверх
+тэга `f50e186`.
+
+### Исправление 14 — Variant A: Wallet/Exchange/Referrals/Daily Tasks (`398f89a`)
+**Проблема:** На Profile-экране кнопки Wallet / Exchange Gems / Referrals
+не имели обработчиков (мёртвая верстка), Daily Tasks был статичным списком.
+
+**Решение:** В корне `LuxUI` подняты модалки `WalletModal` / `ExchangeModal` /
+`ReferralsModal`, добавлен общий wallet-state через новый хук
+`useSyncedSessionString` + CustomEvent bus `lux:session-sync`, Tasks теперь
+читает живой прогресс с backend, тап по кристаллу отправляет `clicksDelta`
+на `/save-score` для прогресса задания `click100`.
+
+**Backend (`react-web-ui/vite.config.ts`):**
+- Добавлены колонки SQLite (идемпотентно через `ALTER TABLE … ADD COLUMN`):
+  `gold`, `referral_code`, `invited_by`, `invited_count`, `clicks_today`,
+  `clicks_date`, `login_days`, `last_login_date`, `claimed_tasks`.
+- `/__mockup/api/user` теперь генерирует `referralCode` при первом логине
+  и крутит дневные счётчики (`clicks_today` сбрасывается при смене даты,
+  `login_days` инкрементится в последовательные дни).
+- Новые эндпоинты:
+  - `POST /exchange-gold` — сжигает gems, начисляет gold по курсу `1000 💎 = 1 ◈`
+  - `POST /referral-info` — возвращает свой код, `invitedCount`, `invitedBy`, `bonusPerInvite`
+  - `POST /activate-referral` — связывает invitee с inviter, начисляет inviter'у `+50 000 💎`
+  - `POST /tasks` — возвращает 3 задания (`click100`/`login7`/`invite1`) с живым прогрессом
+  - `POST /claim-task` — выплачивает награду, если выполнено и ещё не получено
+
+### Исправление 15 — Визуальный парити с Replit-референсом (`1f022c6`)
+**Проблема:** Локальная сборка отличалась от Replit-референса по двум пунктам:
+1. Кристалл был плоской призмой вместо радужно-преломляющего арта.
+2. Mining-экран без подключённого кошелька показывал заглушку "Подключите
+   кошелёк" вместо полного маркетплейса.
+
+**Решение:**
+- `react-web-ui/public/crystal.png` заменён на пользовательский асет
+  (`790x1280`, прозрачный фон).
+- `MiningScreen`: `subTab` по умолчанию = `"shop"` при `eoaAddr === null`
+  (и форсится в `"shop"` при дисконнекте), так что новый пользователь
+  сразу видит 4 карточки майнеров (Basic/Advanced/Elite/Pro). При
+  подключении кошелька автоматически переключается на `"owned"`.
+
+### Исправление 16 — Кросс-табовый refresh userData (`3aa7ed6`)
+**Проблема:** `userData` (gems / gold / streaks / invitedCount) подтягивался
+один раз при логине, потом обновлялся только частично из конкретных
+действий. При переходе на Profile после действий в Tasks (claim, referral
+activation) данные могли быть устаревшими.
+
+**Решение:**
+- В корневой `LuxUI` добавлена `refreshUserData()`, дёргающая
+  `/__mockup/api/user` для свежего снимка.
+- `useEffect([tab, authed])` вызывает её при переходе на вкладки
+  `profile` или `tasks`.
+- `ProfileScreen` подгружает `/referral-info` на mount и отображает
+  реальный `invitedCount` в подписи Referrals-кнопки
+  (`Приглашено: N · +Y K 💎 за каждого`) вместо статичного teaser.
+
+### Проверено end-to-end на превью
+- Claim Daily Reward в Tasks (+5 000 💎) → переключение на Profile →
+  Gems = `5 000 💎`.
+- Exchange → Max → Exchange → Gems = `0 💎`, Gold = `5 ◈`.
+- Mining (нет кошелька) → видна полная карта 4 майнеров с ценами в LUX.
+- Referrals row показывает `Приглашено: 0 · +50K 💎 за каждого` (живые данные).
+
+### Что осталось / не сделано в этой сессии
+- Live Replit-референс был spal — пиксельное сравнение по живой ссылке
+  не делалось; сверка велась по архивным скриншотам и упрощённому
+  `artifacts/mockup-sandbox/.../LuxUI.tsx`.
+- Tasks-экран сохраняет прогресс-бары и кнопки `Claim`/`Go` (это часть
+  Variant A; в Replit-референсе они проще — `✅`/`⬜` ряды). Если нужен
+  чистый визуал референса — нужно убрать прогресс UI, но потеряется
+  функциональный трекинг.
+- Предсуществующая ошибка типов `TS2367` в `BuyModal` (`phase === "idle"`
+  около строки 1167) — из `main`, не из этого PR. Просится follow-up fix.
+- В форке нет CI — единственная проверка это план `/home/ubuntu/test-plan.md`.
+
+### Локальный dev-стек
+
+Используется ПАРАЛЛЕЛЬНАЯ песочница для превью (так как у `react-web-ui/`
+есть зависимости от `mockupPreviewPlugin`, который живёт только в
+Replit-окружении):
+
+- `/home/ubuntu/repos/clicker/react-web-ui/LuxUI.tsx` — источник правды,
+  коммитится в git.
+- `/home/ubuntu/lux-preview/src/LuxUI.tsx` — **symlink** на источник правды.
+- `/home/ubuntu/lux-preview/vite.config.ts` — упрощённый in-memory мок-бэкенд
+  с теми же эндпоинтами `POST /__mockup/api/*` (без SQLite).
+- `/home/ubuntu/lux-preview/public/crystal.png` — копия ассета, чтобы
+  превью показывал ту же картинку.
+
+Запуск:
+```bash
+cd /home/ubuntu/lux-preview && nohup npm run dev > /tmp/lux-preview.log 2>&1 &
+```
+
+Слушает `http://localhost:5173/`. Через `deploy expose port=5173`
+получается публичный basic-auth URL.
+
+---
+
 ## 12. ТЕХНИЧЕСКИЙ СТЕК
 
 | Компонент | Технология |
