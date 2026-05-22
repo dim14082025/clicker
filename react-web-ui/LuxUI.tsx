@@ -294,7 +294,6 @@ function AuthScreen({
 }) {
   const [busy, setBusy]           = useState(false);
   const [manualId, setManualId]   = useState("");
-  const [showManual, setShowManual] = useState(false);
   const widgetRef                 = useRef<HTMLDivElement>(null);
   const daily    = config.dailyReward.toLocaleString("ru-RU");
   const exchange = config.exchangeGemsPerGold.toLocaleString("ru-RU");
@@ -309,13 +308,13 @@ function AuthScreen({
 
   // ── Real Telegram Login Widget ────────────────────────────────────
   // When the user is NOT already inside a Telegram WebApp (e.g. opened in a
-  // regular browser), inject the official Login Widget so they can sign in
-  // through Telegram OAuth. The widget will only render if the bot's domain
-  // is registered with @BotFather → /setdomain.
+  // regular browser), try to inject the official Login Widget. It only
+  // renders if the bot's domain is registered with @BotFather → /setdomain.
+  // If the widget fails (which is the common dev case) we fall through to
+  // a prominent "Open bot in Telegram" CTA + manual ID input.
   useEffect(() => {
     if (inTelegram) return;
     if (!widgetRef.current) return;
-    // Clear previous render (StrictMode double-mount safe)
     widgetRef.current.innerHTML = "";
 
     window.onTelegramAuth = (user) => {
@@ -334,11 +333,16 @@ function AuthScreen({
     script.setAttribute("data-request-access", "write");
     script.setAttribute("data-userpic", "false");
     widgetRef.current.appendChild(script);
+
     return () => {
       if (widgetRef.current) widgetRef.current.innerHTML = "";
       delete window.onTelegramAuth;
     };
   }, [inTelegram, onLogin]);
+
+  function openBotInTelegram() {
+    window.open(`https://t.me/${TG_BOT_USERNAME}`, "_blank", "noopener,noreferrer");
+  }
 
   async function handleClick() {
     if (!telegramId) return;
@@ -387,37 +391,62 @@ function AuthScreen({
             )}
           </button>
         ) : (
-          /* In a regular browser — render the real Telegram Login Widget.
-             The widget injects its own button; when the user authorizes via
-             Telegram OAuth, window.onTelegramAuth fires with their user data
-             and we call onLogin(user.id). */
+          /* Regular browser. We render the real Telegram Login Widget AND
+             a guaranteed-working fallback (open-bot link + manual ID input).
+             Telegram unfortunately always renders an iframe even when the
+             bot domain isn't registered, so we can't reliably detect the
+             failure case — hence the always-on fallback. Setting the bot
+             domain via @BotFather → /setdomain will make the widget button
+             appear inside the iframe; until then the fallback is the way in. */
           <>
-            <div ref={widgetRef} style={{ minHeight: 44, display: "flex", justifyContent: "center", width: "100%" }} />
+            <div
+              ref={widgetRef}
+              style={{
+                minHeight: 44,
+                display: "flex",
+                justifyContent: "center",
+                width: "100%",
+              }}
+            />
+
             <button
-              type="button"
-              onClick={() => setShowManual(s => !s)}
-              style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", background: "none", border: "none", cursor: "pointer", textDecoration: "underline", padding: 0 }}
+              onClick={openBotInTelegram}
+              disabled={busy}
+              style={{
+                width: "100%", padding: "12px 0", borderRadius: 14,
+                background: "linear-gradient(135deg, #0088cc, #005fa3)",
+                border: "1px solid rgba(0,136,204,0.4)",
+                boxShadow: "0 0 24px rgba(0,136,204,0.35)",
+                cursor: "pointer", display: "flex", alignItems: "center",
+                justifyContent: "center", gap: 8, fontSize: 13,
+                fontWeight: 700, color: "#fff", transition: "all 0.2s",
+              }}
             >
-              {showManual ? "Скрыть ручной ввод" : "Использовать demo / ID для теста"}
+              <svg viewBox="0 0 24 24" fill="white" style={{ width: 18, height: 18 }}>
+                <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.03 9.564c-.153.68-.553.847-1.12.527l-3.1-2.285-1.495 1.437c-.165.165-.304.304-.623.304l.223-3.162 5.748-5.192c.25-.222-.054-.345-.388-.123L6.8 14.51l-3.051-.952c-.663-.207-.676-.663.138-.98l11.916-4.595c.55-.2 1.033.134.759.265z" />
+              </svg>
+              Открыть @{TG_BOT_USERNAME} в Telegram
             </button>
-            {showManual && (
-              <div style={{ display: "flex", gap: 8, width: "100%" }}>
-                <input
-                  value={manualId}
-                  onChange={(e) => setManualId(e.target.value)}
-                  placeholder="demo_user или Telegram ID"
-                  style={{ flex: 1, padding: "10px 12px", borderRadius: 12, border: "1px solid rgba(0,212,255,0.25)", background: "rgba(0,0,0,0.4)", color: "#fff", fontSize: 13 }}
-                />
-                <button
-                  onClick={handleManual}
-                  disabled={busy || !manualId.trim()}
-                  className="lux-btn"
-                  style={{ padding: "0 16px", borderRadius: 12, border: "1px solid rgba(0,212,255,0.35)", background: "linear-gradient(135deg, rgba(0,212,255,0.18), rgba(124,58,237,0.18))", color: "#00d4ff", fontSize: 12, fontWeight: 700, opacity: (busy || !manualId.trim()) ? 0.5 : 1, cursor: busy ? "default" : "pointer" }}
-                >
-                  Login
-                </button>
-              </div>
-            )}
+            <p style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", textAlign: "center", lineHeight: 1.4 }}>
+              Нажми «Start» в боте, затем введи свой Telegram ID ниже
+            </p>
+            <div style={{ display: "flex", gap: 8, width: "100%" }}>
+              <input
+                value={manualId}
+                onChange={(e) => setManualId(e.target.value)}
+                placeholder="Telegram ID или demo_user"
+                style={{ flex: 1, padding: "10px 12px", borderRadius: 12, border: "1px solid rgba(0,212,255,0.25)", background: "rgba(0,0,0,0.4)", color: "#fff", fontSize: 13 }}
+                onKeyDown={(e) => { if (e.key === "Enter" && manualId.trim()) handleManual(); }}
+              />
+              <button
+                onClick={handleManual}
+                disabled={busy || !manualId.trim()}
+                className="lux-btn"
+                style={{ padding: "0 18px", borderRadius: 12, border: "1px solid rgba(0,212,255,0.35)", background: "linear-gradient(135deg, rgba(0,212,255,0.22), rgba(124,58,237,0.22))", color: "#00d4ff", fontSize: 12, fontWeight: 700, opacity: (busy || !manualId.trim()) ? 0.5 : 1, cursor: busy ? "default" : "pointer" }}
+              >
+                {busy ? "…" : "Login"}
+              </button>
+            </div>
           </>
         )}
         {loginError && (
