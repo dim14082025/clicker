@@ -102,6 +102,8 @@ const TASKS = {
   click100:    { id: "click100",    reward: 500,    target: 100 },
   login7:      { id: "login7",      reward: 2000,   target: 7   },
   invite1:     { id: "invite1",     reward: 50000,  target: 1   },
+  invite3:     { id: "invite3",     reward: 200000, target: 3   },
+  invite5:     { id: "invite5",     reward: 350000, target: 5   },
 } as const;
 const REFERRAL_BONUS = 50_000; // gems credited to inviter when a friend activates their code
 
@@ -419,6 +421,8 @@ function gameApiPlugin(): Plugin {
             { id: TASKS.click100.id, label: "Click 100 times today",  progress: Math.min(row.clicks_today, TASKS.click100.target),  target: TASKS.click100.target,  reward: TASKS.click100.reward, claimed: claimed.includes(TASKS.click100.id) },
             { id: TASKS.login7.id,   label: "Login 7 days in a row",   progress: Math.min(row.login_days,   TASKS.login7.target),   target: TASKS.login7.target,   reward: TASKS.login7.reward,   claimed: claimed.includes(TASKS.login7.id) },
             { id: TASKS.invite1.id,  label: "Invite 1 friend",          progress: Math.min(row.invited_count, TASKS.invite1.target),  target: TASKS.invite1.target,  reward: TASKS.invite1.reward,  claimed: claimed.includes(TASKS.invite1.id) },
+            { id: TASKS.invite3.id,  label: "Invite 3 friends",         progress: Math.min(row.invited_count, TASKS.invite3.target),  target: TASKS.invite3.target,  reward: TASKS.invite3.reward,  claimed: claimed.includes(TASKS.invite3.id) },
+            { id: TASKS.invite5.id,  label: "Invite 5 friends",         progress: Math.min(row.invited_count, TASKS.invite5.target),  target: TASKS.invite5.target,  reward: TASKS.invite5.reward,  claimed: claimed.includes(TASKS.invite5.id) },
           ];
           return ok(res, { tasks, score: row.score });
         }
@@ -441,6 +445,8 @@ function gameApiPlugin(): Plugin {
             taskId === TASKS.click100.id ? row.clicks_today :
             taskId === TASKS.login7.id   ? row.login_days   :
             taskId === TASKS.invite1.id  ? row.invited_count :
+            taskId === TASKS.invite3.id  ? row.invited_count :
+            taskId === TASKS.invite5.id  ? row.invited_count :
             0;
           if (progress < def.target) return fail(res, "not completed yet");
 

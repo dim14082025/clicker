@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { ethers } from "ethers";
 
 const CSS = `
@@ -272,6 +272,15 @@ function calcPending(inst: MinerInst, gemsPerDay: number): number {
 }
 
 /* ─── AUTH ───────────────────────────────────────────────────── */
+// Telegram Login Widget callback type
+declare global {
+  interface Window {
+    onTelegramAuth?: (user: { id: number; first_name?: string; username?: string; auth_date?: number; hash?: string }) => void;
+  }
+}
+
+const TG_BOT_USERNAME = "LUX_Clicker_bot";
+
 function AuthScreen({
   onLogin, config, tgUser, loginError,
 }: {
@@ -280,24 +289,69 @@ function AuthScreen({
   tgUser: TgUser | null;
   loginError: string | null;
 }) {
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy]           = useState(false);
+  const [manualId, setManualId]   = useState("");
+  const [showManual, setShowManual] = useState(false);
+  const widgetRef                 = useRef<HTMLDivElement>(null);
   const daily    = config.dailyReward.toLocaleString("ru-RU");
   const exchange = config.exchangeGemsPerGold.toLocaleString("ru-RU");
   const goldEq   = Math.round(config.dailyReward / config.exchangeGemsPerGold);
 
-  // If in Telegram context — use real user ID; otherwise use demo
-  const telegramId = tgUser?.id?.toString() ?? "demo_user";
+  // If in Telegram WebApp context — use real user ID directly (no widget needed)
+  const inTelegram = !!tgUser;
+  const telegramId = tgUser?.id?.toString() ?? "";
   const displayName = tgUser
     ? (tgUser.first_name ?? tgUser.username ?? `ID ${tgUser.id}`)
     : null;
 
+  // ── Real Telegram Login Widget ────────────────────────────────────
+  // When the user is NOT already inside a Telegram WebApp (e.g. opened in a
+  // regular browser), inject the official Login Widget so they can sign in
+  // through Telegram OAuth. The widget will only render if the bot's domain
+  // is registered with @BotFather → /setdomain.
+  useEffect(() => {
+    if (inTelegram) return;
+    if (!widgetRef.current) return;
+    // Clear previous render (StrictMode double-mount safe)
+    widgetRef.current.innerHTML = "";
+
+    window.onTelegramAuth = (user) => {
+      if (!user?.id) return;
+      setBusy(true);
+      onLogin(String(user.id)).finally(() => setBusy(false));
+    };
+
+    const script = document.createElement("script");
+    script.async = true;
+    script.src = "https://telegram.org/js/telegram-widget.js?22";
+    script.setAttribute("data-telegram-login", TG_BOT_USERNAME);
+    script.setAttribute("data-size", "large");
+    script.setAttribute("data-radius", "14");
+    script.setAttribute("data-onauth", "onTelegramAuth(user)");
+    script.setAttribute("data-request-access", "write");
+    script.setAttribute("data-userpic", "false");
+    widgetRef.current.appendChild(script);
+    return () => {
+      if (widgetRef.current) widgetRef.current.innerHTML = "";
+      delete window.onTelegramAuth;
+    };
+  }, [inTelegram, onLogin]);
+
   async function handleClick() {
+    if (!telegramId) return;
     setBusy(true);
-    // minimum 800ms so "Connecting…" is visible and not a flash
     await Promise.all([
       onLogin(telegramId),
       new Promise(r => setTimeout(r, 800)),
     ]);
+    setBusy(false);
+  }
+
+  async function handleManual() {
+    const id = manualId.trim();
+    if (!id) return;
+    setBusy(true);
+    await onLogin(id);
     setBusy(false);
   }
 
@@ -313,18 +367,56 @@ function AuthScreen({
       {/* Telegram login */}
       <div className="glass-strong" style={{ borderRadius: 24, padding: "22px 20px", border: "1px solid rgba(0,212,255,0.15)", boxShadow: "0 0 50px rgba(0,212,255,0.06)", width: "100%", display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
         <p style={{ fontSize: 15, fontWeight: 700 }}>Telegram Authorization</p>
-        <button onClick={handleClick} disabled={busy} style={{ width: "100%", padding: "12px 0", borderRadius: 14, background: busy ? "rgba(0,136,204,0.4)" : "linear-gradient(135deg, #0088cc, #005fa3)", border: "1px solid rgba(0,136,204,0.4)", boxShadow: "0 0 24px rgba(0,136,204,0.35)", cursor: busy ? "default" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 13, fontWeight: 700, color: "#fff", transition: "all 0.2s", opacity: busy ? 0.7 : 1 }}>
-          {busy ? (
-            <span style={{ fontSize: 13 }}>Connecting…</span>
-          ) : (
-            <>
-              <svg viewBox="0 0 24 24" fill="white" style={{ width: 18, height: 18 }}>
-                <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.03 9.564c-.153.68-.553.847-1.12.527l-3.1-2.285-1.495 1.437c-.165.165-.304.304-.623.304l.223-3.162 5.748-5.192c.25-.222-.054-.345-.388-.123L6.8 14.51l-3.051-.952c-.663-.207-.676-.663.138-.98l11.916-4.595c.55-.2 1.033.134.759.265z" />
-              </svg>
-              {displayName ? `Войти как ${displayName}` : "Log in with Telegram"}
-            </>
-          )}
-        </button>
+
+        {inTelegram ? (
+          /* Inside a real Telegram Mini App we already have the user — one
+             click confirms and logs them in. */
+          <button onClick={handleClick} disabled={busy} style={{ width: "100%", padding: "12px 0", borderRadius: 14, background: busy ? "rgba(0,136,204,0.4)" : "linear-gradient(135deg, #0088cc, #005fa3)", border: "1px solid rgba(0,136,204,0.4)", boxShadow: "0 0 24px rgba(0,136,204,0.35)", cursor: busy ? "default" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 13, fontWeight: 700, color: "#fff", transition: "all 0.2s", opacity: busy ? 0.7 : 1 }}>
+            {busy ? (
+              <span style={{ fontSize: 13 }}>Connecting…</span>
+            ) : (
+              <>
+                <svg viewBox="0 0 24 24" fill="white" style={{ width: 18, height: 18 }}>
+                  <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.03 9.564c-.153.68-.553.847-1.12.527l-3.1-2.285-1.495 1.437c-.165.165-.304.304-.623.304l.223-3.162 5.748-5.192c.25-.222-.054-.345-.388-.123L6.8 14.51l-3.051-.952c-.663-.207-.676-.663.138-.98l11.916-4.595c.55-.2 1.033.134.759.265z" />
+                </svg>
+                Войти как {displayName}
+              </>
+            )}
+          </button>
+        ) : (
+          /* In a regular browser — render the real Telegram Login Widget.
+             The widget injects its own button; when the user authorizes via
+             Telegram OAuth, window.onTelegramAuth fires with their user data
+             and we call onLogin(user.id). */
+          <>
+            <div ref={widgetRef} style={{ minHeight: 44, display: "flex", justifyContent: "center", width: "100%" }} />
+            <button
+              type="button"
+              onClick={() => setShowManual(s => !s)}
+              style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", background: "none", border: "none", cursor: "pointer", textDecoration: "underline", padding: 0 }}
+            >
+              {showManual ? "Скрыть ручной ввод" : "Использовать demo / ID для теста"}
+            </button>
+            {showManual && (
+              <div style={{ display: "flex", gap: 8, width: "100%" }}>
+                <input
+                  value={manualId}
+                  onChange={(e) => setManualId(e.target.value)}
+                  placeholder="demo_user или Telegram ID"
+                  style={{ flex: 1, padding: "10px 12px", borderRadius: 12, border: "1px solid rgba(0,212,255,0.25)", background: "rgba(0,0,0,0.4)", color: "#fff", fontSize: 13 }}
+                />
+                <button
+                  onClick={handleManual}
+                  disabled={busy || !manualId.trim()}
+                  className="lux-btn"
+                  style={{ padding: "0 16px", borderRadius: 12, border: "1px solid rgba(0,212,255,0.35)", background: "linear-gradient(135deg, rgba(0,212,255,0.18), rgba(124,58,237,0.18))", color: "#00d4ff", fontSize: 12, fontWeight: 700, opacity: (busy || !manualId.trim()) ? 0.5 : 1, cursor: busy ? "default" : "pointer" }}
+                >
+                  Login
+                </button>
+              </div>
+            )}
+          </>
+        )}
         {loginError && (
           <p style={{ fontSize: 11, color: "#ff6b6b", textAlign: "center", lineHeight: 1.4 }}>
             ⚠ {loginError}
@@ -384,27 +476,96 @@ function HomeScreen({
   const [claimBusy, setClaimBusy] = useState(false);
   const [claimMsg, setClaimMsg]   = useState<string | null>(null);
   const [lastDaily, setLastDaily]  = useState<string | null>(initLastDaily);
+  // Anti-cheat: when uniform tap cadence is detected, taps are locked for a
+  // few seconds and the user sees a brief warning.
+  const [tapLockUntil, setTapLockUntil] = useState(0);
+  const [tapLockMsg,   setTapLockMsg]   = useState<string | null>(null);
   const ref    = useRef<HTMLButtonElement>(null);
   const nextId = useRef(0);
 
-  // Auto-save score to backend every 5 seconds while tapping. Also flushes the
-  // number of taps since the last save so the backend can increment clicks_today
-  // (used by Daily Tasks progress).
+  // Auto-save score to backend at most once per second while tapping is
+  // active. We also flush *immediately* on unmount, tab hide, and beforeunload
+  // so that the user never loses unsaved taps when they switch tab/refresh.
+  // Each save sends the absolute score + the delta of clicks since the last
+  // save so the backend can increment clicks_today (used by Daily Tasks).
   const pendingSave   = useRef(false);
   const pendingClicks = useRef(0);
+  const lastSavedAt   = useRef(0);
+  const scoreRef      = useRef(score);
+  useEffect(() => { scoreRef.current = score; }, [score]);
+
+  const flushSave = useCallback((opts?: { keepalive?: boolean }) => {
+    if (!pendingSave.current || !telegram) return;
+    const delta = pendingClicks.current;
+    const s = scoreRef.current;
+    pendingSave.current = false;
+    pendingClicks.current = 0;
+    lastSavedAt.current = Date.now();
+    const body = JSON.stringify({ telegram, score: s, clicksDelta: delta });
+    if (opts?.keepalive && "sendBeacon" in navigator) {
+      // beforeunload — use a fire-and-forget transport that the browser
+      // guarantees to deliver even as the tab unloads.
+      navigator.sendBeacon(`${API_BASE}/save-score`, new Blob([body], { type: "application/json" }));
+      return;
+    }
+    fetch(`${API_BASE}/save-score`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive: opts?.keepalive,
+    }).then(() => onScoreUpdate(s, undefined)).catch(() => {});
+  }, [telegram, onScoreUpdate]);
+
+  // Periodic flush + flush on tab hide / unload / unmount.
   useEffect(() => {
-    const interval = setInterval(() => {
-      if (!pendingSave.current) return;
-      pendingSave.current = false;
-      const delta = pendingClicks.current;
-      pendingClicks.current = 0;
-      apiPost(`${API_BASE}/save-score`, { telegram, score, clicksDelta: delta })
-        .then(() => onScoreUpdate(score, undefined));
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [telegram, score, onScoreUpdate]);
+    const interval = setInterval(() => flushSave(), 1000);
+    const onHide   = () => { if (document.visibilityState === "hidden") flushSave({ keepalive: true }); };
+    const onUnload = () => flushSave({ keepalive: true });
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("beforeunload", onUnload);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("beforeunload", onUnload);
+      flushSave({ keepalive: true });
+    };
+  }, [flushSave]);
+
+  // Anti-cheat: keep the last few tap timestamps. If the most recent intervals
+  // are uniformly spaced (low variance) AND fast, treat as an autoclicker and
+  // lock the crystal for 3 seconds. Real human tapping has natural jitter,
+  // so a 12 ms standard-deviation window catches autoclickers without
+  // false-flagging fast humans.
+  const tapTimes = useRef<number[]>([]);
+  const ANTI_CHEAT_WINDOW = 6;     // sample size
+  const ANTI_CHEAT_STDDEV = 12;    // ms — lower stddev = more uniform = bot-like
+  const ANTI_CHEAT_MAX_INT = 220;  // only police *fast* tapping (>4.5 cps)
+  const ANTI_CHEAT_BLOCK   = 3000; // ms lockout
 
   function tap(e: React.MouseEvent) {
+    const now = Date.now();
+    if (now < tapLockUntil) return; // locked — ignore
+
+    // Rolling sample of intervals
+    tapTimes.current.push(now);
+    if (tapTimes.current.length > ANTI_CHEAT_WINDOW) tapTimes.current.shift();
+    if (tapTimes.current.length === ANTI_CHEAT_WINDOW) {
+      const intervals: number[] = [];
+      for (let i = 1; i < tapTimes.current.length; i++) intervals.push(tapTimes.current[i] - tapTimes.current[i - 1]);
+      const mean = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+      const variance = intervals.reduce((acc, x) => acc + (x - mean) ** 2, 0) / intervals.length;
+      const stddev = Math.sqrt(variance);
+      if (mean < ANTI_CHEAT_MAX_INT && stddev < ANTI_CHEAT_STDDEV) {
+        // Bot-like cadence detected
+        const until = now + ANTI_CHEAT_BLOCK;
+        setTapLockUntil(until);
+        setTapLockMsg("Слишком ровный темп — пауза 3 сек");
+        tapTimes.current = [];
+        setTimeout(() => setTapLockMsg(null), ANTI_CHEAT_BLOCK);
+        return;
+      }
+    }
+
     const rect = ref.current!.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
@@ -459,6 +620,13 @@ function HomeScreen({
       {claimMsg && (
         <div style={{ position: "absolute", top: 90, left: "50%", transform: "translateX(-50%)", background: "linear-gradient(135deg, rgba(0,212,255,0.25), rgba(124,58,237,0.3))", border: "1px solid rgba(0,212,255,0.5)", borderRadius: 14, padding: "10px 20px", fontSize: 14, fontWeight: 800, color: "#00d4ff", boxShadow: "0 0 30px rgba(0,212,255,0.4)", whiteSpace: "nowrap", animation: "slide-in 0.3s ease", zIndex: 100 }}>
           {claimMsg}
+        </div>
+      )}
+
+      {/* Anti-cheat lock toast */}
+      {tapLockMsg && (
+        <div style={{ position: "absolute", top: 130, left: "50%", transform: "translateX(-50%)", background: "linear-gradient(135deg, rgba(239,68,68,0.25), rgba(220,38,38,0.3))", border: "1px solid rgba(239,68,68,0.5)", borderRadius: 14, padding: "10px 20px", fontSize: 13, fontWeight: 700, color: "#fca5a5", boxShadow: "0 0 30px rgba(239,68,68,0.35)", whiteSpace: "nowrap", animation: "slide-in 0.3s ease", zIndex: 100 }}>
+          ⏸ {tapLockMsg}
         </div>
       )}
 
@@ -719,10 +887,11 @@ declare global {
 // Private key is kept only in memory (+ sessionStorage for tab-switch restore).
 let _socialWallet: ethers.Wallet | null = null;
 
-/** Restore a previously-created social wallet from sessionStorage on page load. */
+/** Restore a previously-created social wallet from localStorage on page load.
+ *  Falls back to sessionStorage for backwards compatibility with old sessions. */
 function restoreSocialWallet(): ethers.Wallet | null {
   try {
-    const pk = sessionStorage.getItem("lux_social_pk");
+    const pk = localStorage.getItem("lux_social_pk") ?? sessionStorage.getItem("lux_social_pk");
     if (!pk) return null;
     return new ethers.Wallet(pk);
   } catch { return null; }
@@ -735,8 +904,12 @@ _socialWallet = restoreSocialWallet();
  *  sent to it is accessible once the private key is used to sign transactions. */
 async function deriveSocialWallet(providerId: string): Promise<ethers.Wallet> {
   const tgUser = (window as any).Telegram?.WebApp?.initDataUnsafe?.user;
-  let anonId = sessionStorage.getItem("lux_anon_id");
-  if (!anonId) { anonId = Math.random().toString(36).slice(2, 18); sessionStorage.setItem("lux_anon_id", anonId); }
+  // Anon ID lives in localStorage so the same browser always yields the same
+  // wallet for the same provider+telegram pair. Migrate from sessionStorage if
+  // present (older sessions stored it there).
+  let anonId = localStorage.getItem("lux_anon_id") ?? sessionStorage.getItem("lux_anon_id");
+  if (!anonId) { anonId = Math.random().toString(36).slice(2, 18); }
+  localStorage.setItem("lux_anon_id", anonId);
   const seed = tgUser?.id
     ? `lux:${providerId}:tg:${tgUser.id}`
     : `lux:${providerId}:anon:${anonId}`;
@@ -769,6 +942,8 @@ async function requestAccounts(): Promise<string> {
   _socialWallet = null;
   sessionStorage.removeItem("lux_social_pk");
   sessionStorage.removeItem("lux_social_provider");
+  localStorage.removeItem("lux_social_pk");
+  localStorage.removeItem("lux_social_provider");
   return accounts[0];
 }
 
@@ -866,8 +1041,11 @@ function WalletModal({ onConnect, onClose }: { onConnect: (addr: string) => void
     setError(null);
     try {
       const wallet = await deriveSocialWallet(providerId);
-      // Store private key for transaction signing (tab-switch safe)
-      sessionStorage.setItem("lux_social_pk",       wallet.privateKey);
+      // Store private key for transaction signing (browser-restart safe).
+      // We use localStorage so the wallet survives tab close / reload.
+      localStorage.setItem("lux_social_pk",       wallet.privateKey);
+      localStorage.setItem("lux_social_provider", providerId);
+      sessionStorage.setItem("lux_social_pk",     wallet.privateKey);
       sessionStorage.setItem("lux_social_provider", providerId);
       _socialWallet = wallet; // keep in module-level singleton for sendTx()
       await new Promise(r => setTimeout(r, 700)); // brief UX delay
@@ -1401,6 +1579,8 @@ function MiningScreen({
                   _socialWallet = null;
                   sessionStorage.removeItem("lux_social_pk");
                   sessionStorage.removeItem("lux_social_provider");
+                  localStorage.removeItem("lux_social_pk");
+                  localStorage.removeItem("lux_social_provider");
                 }} style={{ fontSize: 10, color: "rgba(255,80,80,0.6)", background: "none", border: "1px solid rgba(255,80,80,0.2)", borderRadius: 8, padding: "4px 10px", cursor: "pointer" }}>
                   Disconnect
                 </button>
@@ -1974,7 +2154,7 @@ function TasksScreen({
                     <button onClick={() => claimTask(t.id)} disabled={busy} className="lux-btn" style={{ padding: "5px 12px", borderRadius: 9, fontSize: 10, fontWeight: 700, color: "#ffd700", border: "1px solid rgba(255,215,0,0.4)", background: "rgba(255,215,0,0.1)", opacity: busy ? 0.5 : 1 }}>
                       {busy ? "…" : "Claim"}
                     </button>
-                  ) : t.id === "invite1" ? (
+                  ) : (t.id === "invite1" || t.id === "invite3" || t.id === "invite5") ? (
                     <button onClick={openReferrals} className="lux-btn" style={{ padding: "5px 10px", borderRadius: 9, fontSize: 10, fontWeight: 700, minWidth: 50 }}>Go</button>
                   ) : (
                     <span style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", minWidth: 50, textAlign: "center" }}>—</span>
@@ -2028,7 +2208,9 @@ function ProfileScreen({
     setEoaAddr(null);
     setLuxBal(0);
     sessionStorage.removeItem("lux_social_pk");
-    sessionStorage.removeItem("lux_anon_id");
+    sessionStorage.removeItem("lux_social_provider");
+    localStorage.removeItem("lux_social_pk");
+    localStorage.removeItem("lux_social_provider");
   }
 
   return (
