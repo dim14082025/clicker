@@ -1,5 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { ethers } from "ethers";
+import { useConnect } from "thirdweb/react";
+import { inAppWallet, createWallet } from "thirdweb/wallets";
+import { client as twClient, polygonChain, SOCIAL_STRATEGY } from "./thirdweb-config";
 
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
@@ -1014,10 +1017,30 @@ function WalletModal({ onConnect, onClose }: { onConnect: (addr: string) => void
   const pageUrl  = typeof window !== "undefined" ? encodeURIComponent(window.location.href) : "";
   const pageHost = typeof window !== "undefined" ? window.location.host + window.location.pathname : "";
 
+  // Thirdweb v5 hooks — real OAuth-based wallet connect.
+  const { connect: twConnect } = useConnect();
+
   async function connectInjected() {
     setStatus("Connecting…");
     setError(null);
     try {
+      // Prefer Thirdweb's MetaMask wallet (handles chain-switch, signing,
+      // proper provider events). Falls back to direct window.ethereum if
+      // Thirdweb fails for any reason.
+      try {
+        const mm = createWallet("io.metamask");
+        const account = await twConnect(async () => {
+          await mm.connect({ client: twClient, chain: polygonChain });
+          return mm;
+        });
+        if (account?.address) {
+          setStatus(null);
+          onConnect(account.address);
+          return;
+        }
+      } catch {
+        // Fall through to direct injection
+      }
       const addr = await requestAccounts();
       setStatus(null);
       onConnect(addr);
@@ -1031,29 +1054,52 @@ function WalletModal({ onConnect, onClose }: { onConnect: (addr: string) => void
     window.open(url, "_blank");
   }
 
-  /** Create a real secp256k1 EOA from social provider + Telegram/anon seed.
-   *  deriveSocialWallet() → ethers.Wallet → correct Ethereum address.
-   *  Private key stored in sessionStorage so the same session can sign txs.
-   *  The address is a valid Polygon account: MATIC/LUX deposited there is
-   *  spendable via the stored private key (no MetaMask needed). */
+  /** Connect via a *real* social OAuth flow through Thirdweb's in-app wallet.
+   *  Opens the provider's OAuth popup (google.com, telegram.org, etc.),
+   *  authenticates the user, and returns a real EOA that the user controls
+   *  through their social account.
+   *  Falls back to deterministic derivation if Thirdweb fails (offline /
+   *  blocked / unsupported strategy). */
   async function connectSocial(providerId: string) {
     setConnecting(providerId);
     setError(null);
+    const strategy = SOCIAL_STRATEGY[providerId];
     try {
-      const wallet = await deriveSocialWallet(providerId);
-      // Store private key for transaction signing (browser-restart safe).
-      // We use localStorage so the wallet survives tab close / reload.
-      localStorage.setItem("lux_social_pk",       wallet.privateKey);
-      localStorage.setItem("lux_social_provider", providerId);
-      sessionStorage.setItem("lux_social_pk",     wallet.privateKey);
-      sessionStorage.setItem("lux_social_provider", providerId);
-      _socialWallet = wallet; // keep in module-level singleton for sendTx()
-      await new Promise(r => setTimeout(r, 700)); // brief UX delay
-      setConnecting(null);
-      onConnect(wallet.address);
-    } catch {
-      setError("Connection failed. Please try again.");
-      setConnecting(null);
+      if (strategy) {
+        const wallet = inAppWallet();
+        const account = await twConnect(async () => {
+          await wallet.connect({ client: twClient, chain: polygonChain, strategy });
+          return wallet;
+        });
+        if (account?.address) {
+          // Clear the legacy deterministic wallet — Thirdweb manages signing
+          // through its own session now.
+          _socialWallet = null;
+          localStorage.setItem("lux_social_provider", providerId);
+          localStorage.setItem("lux_thirdweb_addr", account.address);
+          setConnecting(null);
+          onConnect(account.address);
+          return;
+        }
+      }
+      throw new Error(`Strategy ${providerId} not supported by Thirdweb`);
+    } catch (err: any) {
+      // Fallback: deterministic SHA-256-based EOA so the user still has a
+      // working wallet even when Thirdweb is unreachable (offline /
+      // popup-blocked).
+      try {
+        const wallet = await deriveSocialWallet(providerId);
+        localStorage.setItem("lux_social_pk",       wallet.privateKey);
+        localStorage.setItem("lux_social_provider", providerId);
+        sessionStorage.setItem("lux_social_pk",     wallet.privateKey);
+        sessionStorage.setItem("lux_social_provider", providerId);
+        _socialWallet = wallet;
+        setConnecting(null);
+        onConnect(wallet.address);
+      } catch {
+        setError(err?.message ?? "Connection failed. Please try again.");
+        setConnecting(null);
+      }
     }
   }
 
