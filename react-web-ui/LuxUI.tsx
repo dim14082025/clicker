@@ -2012,6 +2012,18 @@ function ProfileScreen({
   const gold = userData?.gold ?? 0;
   const shortAddr = eoaAddr ? `${eoaAddr.slice(0, 6)}…${eoaAddr.slice(-4)}` : null;
 
+  // Live referral info — refreshed every time the Profile screen mounts so
+  // the invited-friends counter reflects any referral activated on Tasks
+  // or via the Referrals modal in another tab.
+  const [refInfo, setRefInfo] = useState<RefInfo | null>(null);
+  const telegram = userData?.telegram;
+  useEffect(() => {
+    if (!telegram) return;
+    apiPost<RefInfo>(`${API_BASE}/referral-info`, { telegram }).then(d => {
+      if (d) setRefInfo(d);
+    });
+  }, [telegram, userData?.invitedCount]);
+
   function disconnect() {
     setEoaAddr(null);
     setLuxBal(0);
@@ -2086,7 +2098,11 @@ function ProfileScreen({
       <button onClick={openReferrals} className="lux-btn" style={{ width: "100%", padding: "14px 18px", borderRadius: 16, textAlign: "left", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div>
           <p style={{ fontSize: 13, fontWeight: 700, color: "#fff", marginBottom: 2 }}>◎ Referrals</p>
-          <p style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>Пригласи друзей · +50K 💎 за каждого</p>
+          <p style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>
+            {refInfo
+              ? `Приглашено: ${refInfo.invitedCount} · +${(refInfo.bonusPerInvite / 1000).toFixed(0)}K 💎 за каждого`
+              : "Пригласи друзей · +50K 💎 за каждого"}
+          </p>
         </div>
         <span style={{ color: "rgba(0,212,255,0.5)", fontSize: 16 }}>›</span>
       </button>
@@ -2176,6 +2192,26 @@ export function LuxUI() {
       ...(lastDailyReward !== undefined ? { lastDailyReward } : {}),
     } : u);
   }
+
+  // ── Refresh full userData from backend (used on tab switch) ────
+  // Pulls the canonical row so gold/invitedCount/loginDays/clicksToday
+  // stay in sync after actions done on other tabs (claim task, referral
+  // activation, exchange, etc.).
+  async function refreshUserData() {
+    if (!userData?.telegram) return;
+    const fresh = await apiPost<UserData>(`${API_BASE}/user`, { telegram: userData.telegram });
+    if (fresh) setUserData(fresh);
+  }
+
+  // When the user navigates to Profile or Tasks, refresh once so they see
+  // fresh balances/streaks/invite counts without having to relogin.
+  useEffect(() => {
+    if (!authed) return;
+    if (tab === "profile" || tab === "tasks") {
+      refreshUserData();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, authed]);
 
   return (
     <div className="lux-root" style={{ width: "100vw", height: "100vh", background: "#000", display: "flex", justifyContent: "center", alignItems: "center" }}>
