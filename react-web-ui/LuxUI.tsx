@@ -184,8 +184,12 @@ type RefInfo   = { code: string; invitedCount: number; invitedBy: string | null;
 
 /* ─── API config ─────────────────────────────────────────────── */
 // Dev  → VITE_API_BASE not set → uses Vite mock at /__mockup/api
-// Prod → set VITE_API_BASE=https://clicker.aliterra.space/api in .env.production
-const API_BASE: string = import.meta.env.VITE_API_BASE ?? "/__mockup/api";
+// Prod → set VITE_API_BASE=/api/v2 (or absolute URL) in .env.production
+// VITE_API_SUFFIX is appended to every endpoint name — e.g. set it to ".php"
+// when serving the backend as plain PHP files (saves you from URL rewriting).
+const API_BASE: string   = import.meta.env.VITE_API_BASE   ?? "/__mockup/api";
+const API_SUFFIX: string = import.meta.env.VITE_API_SUFFIX ?? "";
+const api = (name: string): string => `${API_BASE}/${name}${API_SUFFIX}`;
 
 // Image paths — BASE_URL = "/__mockup/" in dev, "/" in prod
 const CRYSTAL_IMG = `${import.meta.env.BASE_URL}crystal.png`;
@@ -537,10 +541,10 @@ function HomeScreen({
     if (opts?.keepalive && "sendBeacon" in navigator) {
       // beforeunload — use a fire-and-forget transport that the browser
       // guarantees to deliver even as the tab unloads.
-      navigator.sendBeacon(`${API_BASE}/save-score`, new Blob([body], { type: "application/json" }));
+      navigator.sendBeacon(api("save-score"), new Blob([body], { type: "application/json" }));
       return;
     }
-    fetch(`${API_BASE}/save-score`, {
+    fetch(api("save-score"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,
@@ -616,7 +620,7 @@ function HomeScreen({
   async function claimDaily() {
     if (!canClaim || claimBusy) return;
     setClaimBusy(true);
-    const res = await apiPost<{ score: number; reward: number }>(`${API_BASE}/claim-daily`, { telegram });
+    const res = await apiPost<{ score: number; reward: number }>(api("claim-daily"), { telegram });
     if (res) {
       const ts = new Date().toISOString();
       setScore(res.score);
@@ -1500,7 +1504,7 @@ function MiningScreen({
           .map((id, i) => ({ tokenId: id, count: balances[i] }))
           .filter(n => n.count > 0);
         if (nftMiners.length === 0) return;
-        const data = await apiPost<MinerGrp[]>(`${API_BASE}/miners`, {
+        const data = await apiPost<MinerGrp[]>(api("miners"), {
           walletAddress: addr,
           nftMiners: JSON.stringify(nftMiners),
         });
@@ -1551,7 +1555,7 @@ function MiningScreen({
         .map((id, i) => ({ tokenId: id, count: balances[i] }))
         .filter(n => n.count > 0);
       if (nftMiners.length === 0) { setMiners([]); return; }
-      const data = await apiPost<MinerGrp[]>(`${API_BASE}/miners`, {
+      const data = await apiPost<MinerGrp[]>(api("miners"), {
         walletAddress: eoaAddr,
         nftMiners: JSON.stringify(nftMiners),
       });
@@ -1565,7 +1569,7 @@ function MiningScreen({
     const key = `${tokenId}-${minerIndex}`;
     if (togglingKey === key) return;
     setTogglingKey(key);
-    const data = await apiPost<MinerInst>(`${API_BASE}/set-miner-active`, {
+    const data = await apiPost<MinerInst>(api("set-miner-active"), {
       walletAddress: eoaAddr,
       minerId: tokenId,
       minerIndex,
@@ -1589,18 +1593,18 @@ function MiningScreen({
     const balances = await Promise.all(tokenIds.map(id => getNftBalance(eoaAddr, Number(id)).catch(() => 0)));
     const nftMiners: NftMiner[] = tokenIds.map((id, i) => ({ tokenId: id, count: balances[i] })).filter(n => n.count > 0);
 
-    const earned = await apiPost<number>(`${API_BASE}/withdrawal-miners`, {
+    const earned = await apiPost<number>(api("withdrawal-miners"), {
       telegram,
       walletAddress: eoaAddr,
       nftMiners: JSON.stringify(nftMiners),
     });
     if (earned !== null) {
-      const data = await apiPost<MinerGrp[]>(`${API_BASE}/miners`, {
+      const data = await apiPost<MinerGrp[]>(api("miners"), {
         walletAddress: eoaAddr,
         nftMiners: JSON.stringify(nftMiners),
       });
       if (data !== null) setMiners(Array.isArray(data) ? data : JSON.parse(data as unknown as string));
-      const user = await apiPost<UserData>(`${API_BASE}/user`, { telegram });
+      const user = await apiPost<UserData>(api("user"), { telegram });
       if (user) onScoreUpdate(user.score, undefined);
       const n = typeof earned === "number" ? earned : Number(earned);
       setWithdrawMsg(n > 0 ? `+${n.toLocaleString("ru-RU")} 💎 добыто!` : "Нет накопленных гемов");
@@ -1943,7 +1947,7 @@ function ExchangeModal({
     if (!canSubmit) return;
     setBusy(true); setErr(null);
     const res = await apiPost<{ score: number; gold: number; exchanged: number }>(
-      `${API_BASE}/exchange-gold`, { telegram, gems: gemsNeeded }
+      api("exchange-gold"), { telegram, gems: gemsNeeded }
     );
     setBusy(false);
     if (!res) { setErr("Exchange failed. Try again."); return; }
@@ -2018,7 +2022,7 @@ function ReferralsModal({
 
   useEffect(() => {
     if (!telegram) return;
-    apiPost<RefInfo>(`${API_BASE}/referral-info`, { telegram }).then(d => { if (d) setInfo(d); });
+    apiPost<RefInfo>(api("referral-info"), { telegram }).then(d => { if (d) setInfo(d); });
   }, [telegram]);
 
   async function copyCode() {
@@ -2029,13 +2033,13 @@ function ReferralsModal({
   async function activate() {
     if (!code.trim() || busy) return;
     setBusy(true); setErr(null); setMsg(null);
-    const res = await apiPost<{ invitedBy: string; bonusAwarded: number }>(`${API_BASE}/activate-referral`, { telegram, code: code.trim() });
+    const res = await apiPost<{ invitedBy: string; bonusAwarded: number }>(api("activate-referral"), { telegram, code: code.trim() });
     setBusy(false);
     if (!res) { setErr("Invalid or already used code."); return; }
     setMsg(`Linked to ${res.invitedBy}. Inviter received +${res.bonusAwarded.toLocaleString("ru-RU")} 💎`);
-    const refreshed = await apiPost<RefInfo>(`${API_BASE}/referral-info`, { telegram });
+    const refreshed = await apiPost<RefInfo>(api("referral-info"), { telegram });
     if (refreshed) setInfo(refreshed);
-    const user = await apiPost<UserData>(`${API_BASE}/user`, { telegram });
+    const user = await apiPost<UserData>(api("user"), { telegram });
     if (user) onActivated(user.score);
     setCode("");
   }
@@ -2126,7 +2130,7 @@ function TasksScreen({
   // progress reflects fresh clicks_today / login_days / invited_count).
   useEffect(() => {
     if (!telegram) return;
-    apiPost<{ tasks: TaskRow[]; score: number }>(`${API_BASE}/tasks`, { telegram }).then(d => {
+    apiPost<{ tasks: TaskRow[]; score: number }>(api("tasks"), { telegram }).then(d => {
       if (d) setTasks(d.tasks);
     });
   }, [telegram, userData?.score, userData?.invitedCount, userData?.loginDays]);
@@ -2134,7 +2138,7 @@ function TasksScreen({
   async function handleClaim() {
     if (!canClaim || claimBusy || !telegram) return;
     setClaimBusy(true);
-    const res = await apiPost<{ score: number; reward: number }>(`${API_BASE}/claim-daily`, { telegram });
+    const res = await apiPost<{ score: number; reward: number }>(api("claim-daily"), { telegram });
     if (res) {
       const ts = new Date().toISOString();
       onScoreUpdate(res.score, ts);
@@ -2148,12 +2152,12 @@ function TasksScreen({
     if (!telegram || taskBusyId) return;
     setTaskBusyId(taskId);
     const res = await apiPost<{ score: number; reward: number; taskId: string }>(
-      `${API_BASE}/claim-task`, { telegram, taskId }
+      api("claim-task"), { telegram, taskId }
     );
     if (res) {
       onScoreUpdate(res.score, undefined);
       // Refresh tasks so claimed=true is reflected
-      const fresh = await apiPost<{ tasks: TaskRow[]; score: number }>(`${API_BASE}/tasks`, { telegram });
+      const fresh = await apiPost<{ tasks: TaskRow[]; score: number }>(api("tasks"), { telegram });
       if (fresh) setTasks(fresh.tasks);
     }
     setTaskBusyId(null);
@@ -2274,7 +2278,7 @@ function ProfileScreen({
   const telegram = userData?.telegram;
   useEffect(() => {
     if (!telegram) return;
-    apiPost<RefInfo>(`${API_BASE}/referral-info`, { telegram }).then(d => {
+    apiPost<RefInfo>(api("referral-info"), { telegram }).then(d => {
       if (d) setRefInfo(d);
     });
   }, [telegram, userData?.invitedCount]);
@@ -2394,7 +2398,7 @@ export function LuxUI() {
 
   // ── Fetch game config on mount ──────────────────────────────────
   useEffect(() => {
-    const BACKEND = `${API_BASE}/game-config`;
+    const BACKEND = api("game-config");
     const STATIC  = `${import.meta.env.BASE_URL}miners-config.json`;
 
     const parseConfig = (raw: unknown): GameConfig => {
@@ -2432,7 +2436,7 @@ export function LuxUI() {
 
   async function handleLogin(telegramId: string) {
     setLoginError(null);
-    const data = await apiPost<UserData>(`${API_BASE}/user`, { telegram: telegramId });
+    const data = await apiPost<UserData>(api("user"), { telegram: telegramId });
     if (data) {
       setUserData(data);
       setAuthed(true);
@@ -2456,7 +2460,7 @@ export function LuxUI() {
   // activation, exchange, etc.).
   async function refreshUserData() {
     if (!userData?.telegram) return;
-    const fresh = await apiPost<UserData>(`${API_BASE}/user`, { telegram: userData.telegram });
+    const fresh = await apiPost<UserData>(api("user"), { telegram: userData.telegram });
     if (fresh) setUserData(fresh);
   }
 
