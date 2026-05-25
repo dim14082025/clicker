@@ -6,7 +6,21 @@ import { client as twClient, polygonChain, SOCIAL_STRATEGY } from "./thirdweb-co
 
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
-* { box-sizing: border-box; margin: 0; padding: 0; }
+* {
+  box-sizing: border-box; margin: 0; padding: 0;
+  /* Suppress the grey/blue tap-highlight rectangle that Android WebView
+     (used by Telegram Mini App) draws around clicked elements. */
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+}
+button, [role="button"], a, img {
+  /* Removes the 300 ms double-tap delay on touch devices — taps feel
+     instant. Also kills focus-ring outlines on tap. */
+  touch-action: manipulation;
+  outline: none;
+  -webkit-tap-highlight-color: transparent !important;
+}
+button { -webkit-user-select: none; user-select: none; }
 
 @keyframes blob-drift {
   0%   { transform: translate(0px,0px) scale(1) rotate(0deg); }
@@ -236,6 +250,55 @@ function useSyncedSessionString(key: string): [string | null, (v: string | null)
     window.dispatchEvent(new CustomEvent("lux:session-sync", { detail: { key, value: next } }));
   };
   return [val, update];
+}
+
+/* ─── Tap feedback (haptic + sound) ───────────────────────────────
+   - Haptic: Telegram WebApp provides HapticFeedback.impactOccurred(),
+     which is the *native* device buzz on iOS/Android. Outside Telegram
+     we fall back to navigator.vibrate().
+   - Sound: a short low click synthesized with Web Audio (≈ 600 Hz sine
+     burst with quick exponential decay, gain ~0.15). No audio files in
+     the bundle. Created lazily on first use because some browsers
+     suspend AudioContext until a user gesture.
+   Both are cheap, safe to call on every tap. Catches all errors so an
+   unsupported environment never breaks the tap. */
+let _audioCtx: AudioContext | null = null;
+function playTapClick(): void {
+  try {
+    const Ctx: typeof AudioContext | undefined =
+      (window as any).AudioContext ?? (window as any).webkitAudioContext;
+    if (!Ctx) return;
+    if (!_audioCtx) _audioCtx = new Ctx();
+    if (_audioCtx.state === "suspended") _audioCtx.resume().catch(() => {});
+    const t0  = _audioCtx.currentTime;
+    const osc = _audioCtx.createOscillator();
+    const gn  = _audioCtx.createGain();
+    osc.type = "sine";
+    // Quick downward sweep from 720 Hz → 380 Hz for a satisfying coin-click feel.
+    osc.frequency.setValueAtTime(720, t0);
+    osc.frequency.exponentialRampToValueAtTime(380, t0 + 0.08);
+    // Short envelope so taps don't muddy when spammed.
+    gn.gain.setValueAtTime(0.0001, t0);
+    gn.gain.exponentialRampToValueAtTime(0.18, t0 + 0.005);
+    gn.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.09);
+    osc.connect(gn).connect(_audioCtx.destination);
+    osc.start(t0);
+    osc.stop(t0 + 0.10);
+  } catch { /* unsupported */ }
+}
+function tapHaptic(): void {
+  try {
+    const haptic = (window as any).Telegram?.WebApp?.HapticFeedback;
+    if (haptic?.impactOccurred) {
+      haptic.impactOccurred("light");
+      return;
+    }
+    if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(8);
+  } catch { /* unsupported */ }
+}
+function triggerTapFeedback(): void {
+  tapHaptic();
+  playTapClick();
 }
 
 /* Decides between the desktop "phone-mockup" frame (390x780 with rounded
@@ -610,6 +673,9 @@ function HomeScreen({
       }
     }
 
+    // Tactile + audible feedback (no-op outside Telegram if unsupported).
+    triggerTapFeedback();
+
     const rect = ref.current!.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
@@ -675,7 +741,21 @@ function HomeScreen({
       )}
 
       {/* Crystal tap button */}
-      <button ref={ref} onClick={tap} style={{ background: "none", border: "none", cursor: "pointer", position: "relative", padding: 0, marginTop: 8, flexShrink: 0 }}>
+      <button
+        ref={ref}
+        onClick={tap}
+        style={{
+          background: "none", border: "none", outline: "none",
+          cursor: "pointer", position: "relative", padding: 0,
+          marginTop: 8, flexShrink: 0,
+          WebkitTapHighlightColor: "transparent",
+          touchAction: "manipulation",
+          WebkitUserSelect: "none",
+          userSelect: "none",
+          appearance: "none",
+          WebkitAppearance: "none",
+        }}
+      >
         {/* outer orbit ring with 4 dots at cardinal points */}
         <div style={{ position: "absolute", inset: -28, borderRadius: "50%", border: "1px solid rgba(0,212,255,0.15)", animation: "ring-spin 12s linear infinite" }}>
           {[
@@ -693,10 +773,15 @@ function HomeScreen({
         <div className={tapped ? "gem-tapped" : "gem-float"} style={{ position: "relative", zIndex: 2 }}>
           <img
             src={CRYSTAL_IMG}
+            draggable={false}
             style={{
               width: 320, height: 260,
               objectFit: "contain", objectPosition: "center",
               display: "block",
+              pointerEvents: "none",
+              WebkitUserSelect: "none",
+              userSelect: "none",
+              WebkitTouchCallout: "none",
               filter: [
                 "drop-shadow(0 0 20px rgba(0,200,255,1))",
                 "drop-shadow(0 0 50px rgba(0,180,255,0.8))",
