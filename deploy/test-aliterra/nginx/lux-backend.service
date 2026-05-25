@@ -1,0 +1,22 @@
+[Unit]
+Description=LUX Clicker backend (Node.js)
+After=network.target
+
+[Service]
+Type=simple
+# Edit User/WorkingDirectory to match where you unzip the backend.
+User=www-data
+WorkingDirectory=/var/www/test.aliterra.space/backend
+Environment=NODE_ENV=production
+Environment=PORT=3001
+# Data file persists user state across restarts. Keep on a writable path.
+Environment=DATA_FILE=/var/www/test.aliterra.space/backend/data.json
+ExecStart=/usr/bin/node /var/www/test.aliterra.space/backend/server.js
+Restart=on-failure
+RestartSec=3
+# Keep stdout/stderr in journalctl
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
