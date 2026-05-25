@@ -1,9 +1,26 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { ethers } from "ethers";
+import { useConnect } from "thirdweb/react";
+import { inAppWallet, createWallet } from "thirdweb/wallets";
+import { client as twClient, polygonChain, SOCIAL_STRATEGY } from "./thirdweb-config";
 
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
-* { box-sizing: border-box; margin: 0; padding: 0; }
+* {
+  box-sizing: border-box; margin: 0; padding: 0;
+  /* Suppress the grey/blue tap-highlight rectangle that Android WebView
+     (used by Telegram Mini App) draws around clicked elements. */
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+}
+button, [role="button"], a, img {
+  /* Removes the 300 ms double-tap delay on touch devices — taps feel
+     instant. Also kills focus-ring outlines on tap. */
+  touch-action: manipulation;
+  outline: none;
+  -webkit-tap-highlight-color: transparent !important;
+}
+button { -webkit-user-select: none; user-select: none; }
 
 @keyframes blob-drift {
   0%   { transform: translate(0px,0px) scale(1) rotate(0deg); }
@@ -161,15 +178,32 @@ type GameConfig = {
   minersStats: { tokenId: string; gemsPerDay: string }[];
 };
 type TgUser    = { id: number; username?: string; first_name?: string };
-type UserData  = { telegram: string; score: number; lastDailyReward: string | null };
+type UserData  = {
+  telegram: string;
+  score: number;
+  lastDailyReward: string | null;
+  gold?: number;
+  referralCode?: string | null;
+  invitedBy?: string | null;
+  invitedCount?: number;
+  clicksToday?: number;
+  loginDays?: number;
+  claimedTasks?: string[];
+};
 type MinerInst = { isActive: boolean; lastTimeReset: string };
 type MinerGrp  = { tokenId: string;  miners: MinerInst[] };
 type NftMiner  = { tokenId: string;  count: number };
+type TaskRow   = { id: string; label: string; progress: number; target: number; reward: number; claimed: boolean };
+type RefInfo   = { code: string; invitedCount: number; invitedBy: string | null; bonusPerInvite: number };
 
 /* ─── API config ─────────────────────────────────────────────── */
 // Dev  → VITE_API_BASE not set → uses Vite mock at /__mockup/api
-// Prod → set VITE_API_BASE=https://clicker.aliterra.space/api in .env.production
-const API_BASE: string = import.meta.env.VITE_API_BASE ?? "/__mockup/api";
+// Prod → set VITE_API_BASE=/api/v2 (or absolute URL) in .env.production
+// VITE_API_SUFFIX is appended to every endpoint name — e.g. set it to ".php"
+// when serving the backend as plain PHP files (saves you from URL rewriting).
+const API_BASE: string   = import.meta.env.VITE_API_BASE   ?? "/__mockup/api";
+const API_SUFFIX: string = import.meta.env.VITE_API_SUFFIX ?? "";
+const api = (name: string): string => `${API_BASE}/${name}${API_SUFFIX}`;
 
 // Image paths — BASE_URL = "/__mockup/" in dev, "/" in prod
 const CRYSTAL_IMG = `${import.meta.env.BASE_URL}crystal.png`;
@@ -195,6 +229,111 @@ function canClaimDaily(userData: UserData, config: GameConfig): boolean {
   if (!userData.lastDailyReward) return true;
   const elapsed = (Date.now() - new Date(userData.lastDailyReward).getTime()) / 1000;
   return elapsed >= config.dailyRewardTime;
+}
+
+// Session-storage-backed string state that synchronizes across components in
+// the same tab via a CustomEvent bus. Used so Profile + Mining stay in lockstep
+// on the connected wallet address without prop-drilling through every render.
+function useSyncedSessionString(key: string): [string | null, (v: string | null) => void] {
+  const [val, setVal] = useState<string | null>(() => sessionStorage.getItem(key));
+  useEffect(() => {
+    function onEv(e: Event) {
+      const ce = e as CustomEvent<{ key: string; value: string | null }>;
+      if (ce.detail?.key === key) setVal(ce.detail.value);
+    }
+    window.addEventListener("lux:session-sync", onEv);
+    return () => window.removeEventListener("lux:session-sync", onEv);
+  }, [key]);
+  const update = (next: string | null) => {
+    setVal(next);
+    if (next) sessionStorage.setItem(key, next); else sessionStorage.removeItem(key);
+    window.dispatchEvent(new CustomEvent("lux:session-sync", { detail: { key, value: next } }));
+  };
+  return [val, update];
+}
+
+/* ─── Tap feedback (haptic + sound) ───────────────────────────────
+   - Haptic: Telegram WebApp provides HapticFeedback.impactOccurred(),
+     which is the *native* device buzz on iOS/Android. Outside Telegram
+     we fall back to navigator.vibrate().
+   - Sound: a short low click synthesized with Web Audio (≈ 600 Hz sine
+     burst with quick exponential decay, gain ~0.15). No audio files in
+     the bundle. Created lazily on first use because some browsers
+     suspend AudioContext until a user gesture.
+   Both are cheap, safe to call on every tap. Catches all errors so an
+   unsupported environment never breaks the tap. */
+let _audioCtx: AudioContext | null = null;
+function playTapClick(): void {
+  try {
+    const Ctx: typeof AudioContext | undefined =
+      (window as any).AudioContext ?? (window as any).webkitAudioContext;
+    if (!Ctx) return;
+    if (!_audioCtx) _audioCtx = new Ctx();
+    if (_audioCtx.state === "suspended") _audioCtx.resume().catch(() => {});
+    const t0  = _audioCtx.currentTime;
+    const osc = _audioCtx.createOscillator();
+    const gn  = _audioCtx.createGain();
+    osc.type = "sine";
+    // Quick downward sweep from 720 Hz → 380 Hz for a satisfying coin-click feel.
+    osc.frequency.setValueAtTime(720, t0);
+    osc.frequency.exponentialRampToValueAtTime(380, t0 + 0.08);
+    // Short envelope so taps don't muddy when spammed.
+    gn.gain.setValueAtTime(0.0001, t0);
+    gn.gain.exponentialRampToValueAtTime(0.18, t0 + 0.005);
+    gn.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.09);
+    osc.connect(gn).connect(_audioCtx.destination);
+    osc.start(t0);
+    osc.stop(t0 + 0.10);
+  } catch { /* unsupported */ }
+}
+function tapHaptic(): void {
+  try {
+    const haptic = (window as any).Telegram?.WebApp?.HapticFeedback;
+    if (haptic?.impactOccurred) {
+      haptic.impactOccurred("light");
+      return;
+    }
+    if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(8);
+  } catch { /* unsupported */ }
+}
+function triggerTapFeedback(): void {
+  tapHaptic();
+  playTapClick();
+}
+
+/* Decides between the desktop "phone-mockup" frame (390x780 with rounded
+   corners) and a viewport-filling mobile/Telegram layout. Compact wins
+   when running inside a Telegram WebApp, on a narrow viewport, or on a
+   coarse-pointer device (mobile/tablet). Re-evaluates on resize. */
+function useIsCompactViewport(forceCompact: boolean): boolean {
+  const compute = () => {
+    if (typeof window === "undefined") return false;
+    if (forceCompact) return true;
+    // The Telegram WebApp SDK creates `window.Telegram.WebApp` even in a
+    // regular desktop browser, so its mere presence is not a reliable
+    // "inside Telegram" signal. The discriminator is initData length:
+    // populated only when Telegram itself opened the page as a Mini App.
+    const tg = (window as any).Telegram?.WebApp;
+    if (tg && typeof tg.initData === "string" && tg.initData.length > 0) return true;
+    const narrow = window.innerWidth < 500;
+    const coarse =
+      typeof navigator !== "undefined" &&
+      /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+    return narrow || coarse;
+  };
+  const [v, setV] = useState<boolean>(compute);
+  useEffect(() => {
+    const onResize = () => setV(compute());
+    window.addEventListener("resize", onResize);
+    window.addEventListener("orientationchange", onResize);
+    onResize();
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("orientationchange", onResize);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [forceCompact]);
+  return v;
 }
 
 function fmtTime(sec: number): string {
@@ -238,6 +377,15 @@ function calcPending(inst: MinerInst, gemsPerDay: number): number {
 }
 
 /* ─── AUTH ───────────────────────────────────────────────────── */
+// Telegram Login Widget callback type
+declare global {
+  interface Window {
+    onTelegramAuth?: (user: { id: number; first_name?: string; username?: string; auth_date?: number; hash?: string }) => void;
+  }
+}
+
+const TG_BOT_USERNAME: string = import.meta.env.VITE_TELEGRAM_BOT_NAME ?? "LUX_Clicker_bot";
+
 function AuthScreen({
   onLogin, config, tgUser, loginError,
 }: {
@@ -246,24 +394,69 @@ function AuthScreen({
   tgUser: TgUser | null;
   loginError: string | null;
 }) {
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy]           = useState(false);
+  const [manualId, setManualId]   = useState("");
+  const widgetRef                 = useRef<HTMLDivElement>(null);
   const daily    = config.dailyReward.toLocaleString("ru-RU");
   const exchange = config.exchangeGemsPerGold.toLocaleString("ru-RU");
   const goldEq   = Math.round(config.dailyReward / config.exchangeGemsPerGold);
 
-  // If in Telegram context — use real user ID; otherwise use demo
-  const telegramId = tgUser?.id?.toString() ?? "demo_user";
+  // If in Telegram WebApp context — use real user ID directly (no widget needed)
+  const inTelegram = !!tgUser;
+  const telegramId = tgUser?.id?.toString() ?? "";
   const displayName = tgUser
     ? (tgUser.first_name ?? tgUser.username ?? `ID ${tgUser.id}`)
     : null;
 
+  // ── Real Telegram Login Widget ────────────────────────────────────
+  // When the user is NOT already inside a Telegram WebApp (e.g. opened in a
+  // regular browser), try to inject the official Login Widget. It only
+  // renders if the bot's domain is registered with @BotFather → /setdomain.
+  // If the widget fails (which is the common dev case) we fall through to
+  // a prominent "Open bot in Telegram" CTA + manual ID input.
+  useEffect(() => {
+    if (inTelegram) return;
+    if (!widgetRef.current) return;
+    widgetRef.current.innerHTML = "";
+
+    window.onTelegramAuth = (user) => {
+      if (!user?.id) return;
+      setBusy(true);
+      onLogin(String(user.id)).finally(() => setBusy(false));
+    };
+
+    const script = document.createElement("script");
+    script.async = true;
+    script.src = "https://telegram.org/js/telegram-widget.js?22";
+    script.setAttribute("data-telegram-login", TG_BOT_USERNAME);
+    script.setAttribute("data-size", "large");
+    script.setAttribute("data-radius", "14");
+    script.setAttribute("data-onauth", "onTelegramAuth(user)");
+    script.setAttribute("data-request-access", "write");
+    script.setAttribute("data-userpic", "false");
+    widgetRef.current.appendChild(script);
+
+    return () => {
+      if (widgetRef.current) widgetRef.current.innerHTML = "";
+      delete window.onTelegramAuth;
+    };
+  }, [inTelegram, onLogin]);
+
   async function handleClick() {
+    if (!telegramId) return;
     setBusy(true);
-    // minimum 800ms so "Connecting…" is visible and not a flash
     await Promise.all([
       onLogin(telegramId),
       new Promise(r => setTimeout(r, 800)),
     ]);
+    setBusy(false);
+  }
+
+  async function handleManual() {
+    const id = manualId.trim();
+    if (!id) return;
+    setBusy(true);
+    await onLogin(id);
     setBusy(false);
   }
 
@@ -279,18 +472,58 @@ function AuthScreen({
       {/* Telegram login */}
       <div className="glass-strong" style={{ borderRadius: 24, padding: "22px 20px", border: "1px solid rgba(0,212,255,0.15)", boxShadow: "0 0 50px rgba(0,212,255,0.06)", width: "100%", display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
         <p style={{ fontSize: 15, fontWeight: 700 }}>Telegram Authorization</p>
-        <button onClick={handleClick} disabled={busy} style={{ width: "100%", padding: "12px 0", borderRadius: 14, background: busy ? "rgba(0,136,204,0.4)" : "linear-gradient(135deg, #0088cc, #005fa3)", border: "1px solid rgba(0,136,204,0.4)", boxShadow: "0 0 24px rgba(0,136,204,0.35)", cursor: busy ? "default" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 13, fontWeight: 700, color: "#fff", transition: "all 0.2s", opacity: busy ? 0.7 : 1 }}>
-          {busy ? (
-            <span style={{ fontSize: 13 }}>Connecting…</span>
-          ) : (
-            <>
-              <svg viewBox="0 0 24 24" fill="white" style={{ width: 18, height: 18 }}>
-                <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.03 9.564c-.153.68-.553.847-1.12.527l-3.1-2.285-1.495 1.437c-.165.165-.304.304-.623.304l.223-3.162 5.748-5.192c.25-.222-.054-.345-.388-.123L6.8 14.51l-3.051-.952c-.663-.207-.676-.663.138-.98l11.916-4.595c.55-.2 1.033.134.759.265z" />
-              </svg>
-              {displayName ? `Войти как ${displayName}` : "Log in with Telegram"}
-            </>
-          )}
-        </button>
+
+        {inTelegram ? (
+          /* Inside a real Telegram Mini App we already have the user — one
+             click confirms and logs them in. */
+          <button onClick={handleClick} disabled={busy} style={{ width: "100%", padding: "12px 0", borderRadius: 14, background: busy ? "rgba(0,136,204,0.4)" : "linear-gradient(135deg, #0088cc, #005fa3)", border: "1px solid rgba(0,136,204,0.4)", boxShadow: "0 0 24px rgba(0,136,204,0.35)", cursor: busy ? "default" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 13, fontWeight: 700, color: "#fff", transition: "all 0.2s", opacity: busy ? 0.7 : 1 }}>
+            {busy ? (
+              <span style={{ fontSize: 13 }}>Connecting…</span>
+            ) : (
+              <>
+                <svg viewBox="0 0 24 24" fill="white" style={{ width: 18, height: 18 }}>
+                  <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.03 9.564c-.153.68-.553.847-1.12.527l-3.1-2.285-1.495 1.437c-.165.165-.304.304-.623.304l.223-3.162 5.748-5.192c.25-.222-.054-.345-.388-.123L6.8 14.51l-3.051-.952c-.663-.207-.676-.663.138-.98l11.916-4.595c.55-.2 1.033.134.759.265z" />
+                </svg>
+                Войти как {displayName}
+              </>
+            )}
+          </button>
+        ) : (
+          /* Regular browser. Show the official Telegram Login Widget, plus
+             a compact manual-ID fallback for QA/testing (e.g. when the
+             tester doesn't want to OAuth through Telegram). */
+          <>
+            <div
+              ref={widgetRef}
+              style={{
+                minHeight: 44,
+                display: "flex",
+                justifyContent: "center",
+                width: "100%",
+              }}
+            />
+            <p style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", textAlign: "center", lineHeight: 1.4, margin: "4px 0 -4px" }}>
+              или введи Telegram ID вручную для теста
+            </p>
+            <div style={{ display: "flex", gap: 8, width: "100%" }}>
+              <input
+                value={manualId}
+                onChange={(e) => setManualId(e.target.value)}
+                placeholder="Telegram ID или demo_user"
+                style={{ flex: 1, padding: "10px 12px", borderRadius: 12, border: "1px solid rgba(0,212,255,0.25)", background: "rgba(0,0,0,0.4)", color: "#fff", fontSize: 13 }}
+                onKeyDown={(e) => { if (e.key === "Enter" && manualId.trim()) handleManual(); }}
+              />
+              <button
+                onClick={handleManual}
+                disabled={busy || !manualId.trim()}
+                className="lux-btn"
+                style={{ padding: "0 18px", borderRadius: 12, border: "1px solid rgba(0,212,255,0.35)", background: "linear-gradient(135deg, rgba(0,212,255,0.22), rgba(124,58,237,0.22))", color: "#00d4ff", fontSize: 12, fontWeight: 700, opacity: (busy || !manualId.trim()) ? 0.5 : 1, cursor: busy ? "default" : "pointer" }}
+              >
+                {busy ? "…" : "Login"}
+              </button>
+            </div>
+          </>
+        )}
         {loginError && (
           <p style={{ fontSize: 11, color: "#ff6b6b", textAlign: "center", lineHeight: 1.4 }}>
             ⚠ {loginError}
@@ -350,28 +583,106 @@ function HomeScreen({
   const [claimBusy, setClaimBusy] = useState(false);
   const [claimMsg, setClaimMsg]   = useState<string | null>(null);
   const [lastDaily, setLastDaily]  = useState<string | null>(initLastDaily);
+  // Anti-cheat: when uniform tap cadence is detected, taps are locked for a
+  // few seconds and the user sees a brief warning.
+  const [tapLockUntil, setTapLockUntil] = useState(0);
+  const [tapLockMsg,   setTapLockMsg]   = useState<string | null>(null);
   const ref    = useRef<HTMLButtonElement>(null);
   const nextId = useRef(0);
 
-  // Auto-save score to backend every 5 seconds while tapping
-  const pendingSave = useRef(false);
+  // Auto-save score to backend at most once per second while tapping is
+  // active. We also flush *immediately* on unmount, tab hide, and beforeunload
+  // so that the user never loses unsaved taps when they switch tab/refresh.
+  // Each save sends the absolute score + the delta of clicks since the last
+  // save so the backend can increment clicks_today (used by Daily Tasks).
+  const pendingSave   = useRef(false);
+  const pendingClicks = useRef(0);
+  const lastSavedAt   = useRef(0);
+  const scoreRef      = useRef(score);
+  useEffect(() => { scoreRef.current = score; }, [score]);
+
+  const flushSave = useCallback((opts?: { keepalive?: boolean }) => {
+    if (!pendingSave.current || !telegram) return;
+    const delta = pendingClicks.current;
+    const s = scoreRef.current;
+    pendingSave.current = false;
+    pendingClicks.current = 0;
+    lastSavedAt.current = Date.now();
+    const body = JSON.stringify({ telegram, score: s, clicksDelta: delta });
+    if (opts?.keepalive && "sendBeacon" in navigator) {
+      // beforeunload — use a fire-and-forget transport that the browser
+      // guarantees to deliver even as the tab unloads.
+      navigator.sendBeacon(api("save-score"), new Blob([body], { type: "application/json" }));
+      return;
+    }
+    fetch(api("save-score"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive: opts?.keepalive,
+    }).then(() => onScoreUpdate(s, undefined)).catch(() => {});
+  }, [telegram, onScoreUpdate]);
+
+  // Periodic flush + flush on tab hide / unload / unmount.
   useEffect(() => {
-    const interval = setInterval(() => {
-      if (!pendingSave.current) return;
-      pendingSave.current = false;
-      apiPost(`${API_BASE}/save-score`, { telegram, score })
-        .then(() => onScoreUpdate(score, undefined));
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [telegram, score, onScoreUpdate]);
+    const interval = setInterval(() => flushSave(), 1000);
+    const onHide   = () => { if (document.visibilityState === "hidden") flushSave({ keepalive: true }); };
+    const onUnload = () => flushSave({ keepalive: true });
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("beforeunload", onUnload);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("beforeunload", onUnload);
+      flushSave({ keepalive: true });
+    };
+  }, [flushSave]);
+
+  // Anti-cheat: keep the last few tap timestamps. If the most recent intervals
+  // are uniformly spaced (low variance) AND fast, treat as an autoclicker and
+  // lock the crystal for 3 seconds. Real human tapping has natural jitter,
+  // so a 12 ms standard-deviation window catches autoclickers without
+  // false-flagging fast humans.
+  const tapTimes = useRef<number[]>([]);
+  const ANTI_CHEAT_WINDOW = 6;     // sample size
+  const ANTI_CHEAT_STDDEV = 12;    // ms — lower stddev = more uniform = bot-like
+  const ANTI_CHEAT_MAX_INT = 220;  // only police *fast* tapping (>4.5 cps)
+  const ANTI_CHEAT_BLOCK   = 3000; // ms lockout
 
   function tap(e: React.MouseEvent) {
+    const now = Date.now();
+    if (now < tapLockUntil) return; // locked — ignore
+
+    // Rolling sample of intervals
+    tapTimes.current.push(now);
+    if (tapTimes.current.length > ANTI_CHEAT_WINDOW) tapTimes.current.shift();
+    if (tapTimes.current.length === ANTI_CHEAT_WINDOW) {
+      const intervals: number[] = [];
+      for (let i = 1; i < tapTimes.current.length; i++) intervals.push(tapTimes.current[i] - tapTimes.current[i - 1]);
+      const mean = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+      const variance = intervals.reduce((acc, x) => acc + (x - mean) ** 2, 0) / intervals.length;
+      const stddev = Math.sqrt(variance);
+      if (mean < ANTI_CHEAT_MAX_INT && stddev < ANTI_CHEAT_STDDEV) {
+        // Bot-like cadence detected
+        const until = now + ANTI_CHEAT_BLOCK;
+        setTapLockUntil(until);
+        setTapLockMsg("Слишком ровный темп — пауза 3 сек");
+        tapTimes.current = [];
+        setTimeout(() => setTapLockMsg(null), ANTI_CHEAT_BLOCK);
+        return;
+      }
+    }
+
+    // Tactile + audible feedback (no-op outside Telegram if unsupported).
+    triggerTapFeedback();
+
     const rect = ref.current!.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
     const id = nextId.current++;
     setScore(s => s + 1);
     pendingSave.current = true;
+    pendingClicks.current += 1;
     setFlies(f => [...f, { id, x, y }]);
     setTapped(true);
     setTimeout(() => setTapped(false), 350);
@@ -383,7 +694,7 @@ function HomeScreen({
   async function claimDaily() {
     if (!canClaim || claimBusy) return;
     setClaimBusy(true);
-    const res = await apiPost<{ score: number; reward: number }>(`${API_BASE}/claim-daily`, { telegram });
+    const res = await apiPost<{ score: number; reward: number }>(api("claim-daily"), { telegram });
     if (res) {
       const ts = new Date().toISOString();
       setScore(res.score);
@@ -422,8 +733,29 @@ function HomeScreen({
         </div>
       )}
 
+      {/* Anti-cheat lock toast */}
+      {tapLockMsg && (
+        <div style={{ position: "absolute", top: 130, left: "50%", transform: "translateX(-50%)", background: "linear-gradient(135deg, rgba(239,68,68,0.25), rgba(220,38,38,0.3))", border: "1px solid rgba(239,68,68,0.5)", borderRadius: 14, padding: "10px 20px", fontSize: 13, fontWeight: 700, color: "#fca5a5", boxShadow: "0 0 30px rgba(239,68,68,0.35)", whiteSpace: "nowrap", animation: "slide-in 0.3s ease", zIndex: 100 }}>
+          ⏸ {tapLockMsg}
+        </div>
+      )}
+
       {/* Crystal tap button */}
-      <button ref={ref} onClick={tap} style={{ background: "none", border: "none", cursor: "pointer", position: "relative", padding: 0, marginTop: 8, flexShrink: 0 }}>
+      <button
+        ref={ref}
+        onClick={tap}
+        style={{
+          background: "none", border: "none", outline: "none",
+          cursor: "pointer", position: "relative", padding: 0,
+          marginTop: 8, flexShrink: 0,
+          WebkitTapHighlightColor: "transparent",
+          touchAction: "manipulation",
+          WebkitUserSelect: "none",
+          userSelect: "none",
+          appearance: "none",
+          WebkitAppearance: "none",
+        }}
+      >
         {/* outer orbit ring with 4 dots at cardinal points */}
         <div style={{ position: "absolute", inset: -28, borderRadius: "50%", border: "1px solid rgba(0,212,255,0.15)", animation: "ring-spin 12s linear infinite" }}>
           {[
@@ -441,10 +773,15 @@ function HomeScreen({
         <div className={tapped ? "gem-tapped" : "gem-float"} style={{ position: "relative", zIndex: 2 }}>
           <img
             src={CRYSTAL_IMG}
+            draggable={false}
             style={{
               width: 320, height: 260,
               objectFit: "contain", objectPosition: "center",
               display: "block",
+              pointerEvents: "none",
+              WebkitUserSelect: "none",
+              userSelect: "none",
+              WebkitTouchCallout: "none",
               filter: [
                 "drop-shadow(0 0 20px rgba(0,200,255,1))",
                 "drop-shadow(0 0 50px rgba(0,180,255,0.8))",
@@ -679,10 +1016,11 @@ declare global {
 // Private key is kept only in memory (+ sessionStorage for tab-switch restore).
 let _socialWallet: ethers.Wallet | null = null;
 
-/** Restore a previously-created social wallet from sessionStorage on page load. */
+/** Restore a previously-created social wallet from localStorage on page load.
+ *  Falls back to sessionStorage for backwards compatibility with old sessions. */
 function restoreSocialWallet(): ethers.Wallet | null {
   try {
-    const pk = sessionStorage.getItem("lux_social_pk");
+    const pk = localStorage.getItem("lux_social_pk") ?? sessionStorage.getItem("lux_social_pk");
     if (!pk) return null;
     return new ethers.Wallet(pk);
   } catch { return null; }
@@ -695,8 +1033,12 @@ _socialWallet = restoreSocialWallet();
  *  sent to it is accessible once the private key is used to sign transactions. */
 async function deriveSocialWallet(providerId: string): Promise<ethers.Wallet> {
   const tgUser = (window as any).Telegram?.WebApp?.initDataUnsafe?.user;
-  let anonId = sessionStorage.getItem("lux_anon_id");
-  if (!anonId) { anonId = Math.random().toString(36).slice(2, 18); sessionStorage.setItem("lux_anon_id", anonId); }
+  // Anon ID lives in localStorage so the same browser always yields the same
+  // wallet for the same provider+telegram pair. Migrate from sessionStorage if
+  // present (older sessions stored it there).
+  let anonId = localStorage.getItem("lux_anon_id") ?? sessionStorage.getItem("lux_anon_id");
+  if (!anonId) { anonId = Math.random().toString(36).slice(2, 18); }
+  localStorage.setItem("lux_anon_id", anonId);
   const seed = tgUser?.id
     ? `lux:${providerId}:tg:${tgUser.id}`
     : `lux:${providerId}:anon:${anonId}`;
@@ -729,6 +1071,8 @@ async function requestAccounts(): Promise<string> {
   _socialWallet = null;
   sessionStorage.removeItem("lux_social_pk");
   sessionStorage.removeItem("lux_social_provider");
+  localStorage.removeItem("lux_social_pk");
+  localStorage.removeItem("lux_social_provider");
   return accounts[0];
 }
 
@@ -799,10 +1143,30 @@ function WalletModal({ onConnect, onClose }: { onConnect: (addr: string) => void
   const pageUrl  = typeof window !== "undefined" ? encodeURIComponent(window.location.href) : "";
   const pageHost = typeof window !== "undefined" ? window.location.host + window.location.pathname : "";
 
+  // Thirdweb v5 hooks — real OAuth-based wallet connect.
+  const { connect: twConnect } = useConnect();
+
   async function connectInjected() {
     setStatus("Connecting…");
     setError(null);
     try {
+      // Prefer Thirdweb's MetaMask wallet (handles chain-switch, signing,
+      // proper provider events). Falls back to direct window.ethereum if
+      // Thirdweb fails for any reason.
+      try {
+        const mm = createWallet("io.metamask");
+        const account = await twConnect(async () => {
+          await mm.connect({ client: twClient, chain: polygonChain });
+          return mm;
+        });
+        if (account?.address) {
+          setStatus(null);
+          onConnect(account.address);
+          return;
+        }
+      } catch {
+        // Fall through to direct injection
+      }
       const addr = await requestAccounts();
       setStatus(null);
       onConnect(addr);
@@ -816,26 +1180,52 @@ function WalletModal({ onConnect, onClose }: { onConnect: (addr: string) => void
     window.open(url, "_blank");
   }
 
-  /** Create a real secp256k1 EOA from social provider + Telegram/anon seed.
-   *  deriveSocialWallet() → ethers.Wallet → correct Ethereum address.
-   *  Private key stored in sessionStorage so the same session can sign txs.
-   *  The address is a valid Polygon account: MATIC/LUX deposited there is
-   *  spendable via the stored private key (no MetaMask needed). */
+  /** Connect via a *real* social OAuth flow through Thirdweb's in-app wallet.
+   *  Opens the provider's OAuth popup (google.com, telegram.org, etc.),
+   *  authenticates the user, and returns a real EOA that the user controls
+   *  through their social account.
+   *  Falls back to deterministic derivation if Thirdweb fails (offline /
+   *  blocked / unsupported strategy). */
   async function connectSocial(providerId: string) {
     setConnecting(providerId);
     setError(null);
+    const strategy = SOCIAL_STRATEGY[providerId];
     try {
-      const wallet = await deriveSocialWallet(providerId);
-      // Store private key for transaction signing (tab-switch safe)
-      sessionStorage.setItem("lux_social_pk",       wallet.privateKey);
-      sessionStorage.setItem("lux_social_provider", providerId);
-      _socialWallet = wallet; // keep in module-level singleton for sendTx()
-      await new Promise(r => setTimeout(r, 700)); // brief UX delay
-      setConnecting(null);
-      onConnect(wallet.address);
-    } catch {
-      setError("Connection failed. Please try again.");
-      setConnecting(null);
+      if (strategy) {
+        const wallet = inAppWallet();
+        const account = await twConnect(async () => {
+          await wallet.connect({ client: twClient, chain: polygonChain, strategy });
+          return wallet;
+        });
+        if (account?.address) {
+          // Clear the legacy deterministic wallet — Thirdweb manages signing
+          // through its own session now.
+          _socialWallet = null;
+          localStorage.setItem("lux_social_provider", providerId);
+          localStorage.setItem("lux_thirdweb_addr", account.address);
+          setConnecting(null);
+          onConnect(account.address);
+          return;
+        }
+      }
+      throw new Error(`Strategy ${providerId} not supported by Thirdweb`);
+    } catch (err: any) {
+      // Fallback: deterministic SHA-256-based EOA so the user still has a
+      // working wallet even when Thirdweb is unreachable (offline /
+      // popup-blocked).
+      try {
+        const wallet = await deriveSocialWallet(providerId);
+        localStorage.setItem("lux_social_pk",       wallet.privateKey);
+        localStorage.setItem("lux_social_provider", providerId);
+        sessionStorage.setItem("lux_social_pk",     wallet.privateKey);
+        sessionStorage.setItem("lux_social_provider", providerId);
+        _socialWallet = wallet;
+        setConnecting(null);
+        onConnect(wallet.address);
+      } catch {
+        setError(err?.message ?? "Connection failed. Please try again.");
+        setConnecting(null);
+      }
     }
   }
 
@@ -1144,35 +1534,32 @@ function BuyModal({
 }
 
 function MiningScreen({
-  telegram, onScoreUpdate,
+  telegram, onScoreUpdate, eoaAddr, setEoaAddr, luxBal, setLuxBal, openWalletModal,
 }: {
   telegram: string;
   onScoreUpdate: (s: number, lastDaily?: string | null) => void;
+  eoaAddr: string | null;
+  setEoaAddr: (addr: string | null) => void;
+  luxBal: number;
+  setLuxBal: (n: number) => void;
+  openWalletModal: () => void;
 }) {
-  const [subTab, setSubTab]               = useState<"owned" | "shop">("owned");
-  // walletAddr = the address the user connected. Persisted in sessionStorage so it
-  // survives tab switches (component unmount/remount) without re-connecting.
-  const [eoaAddr, setEoaAddr] = useState<string | null>(() =>
-    sessionStorage.getItem("lux_eoa")
-  );
-
-  // Wrapper: keep sessionStorage in sync with state
-  function persistEoa(addr: string | null) {
-    setEoaAddr(addr);
-    if (addr) sessionStorage.setItem("lux_eoa", addr);
-    else sessionStorage.removeItem("lux_eoa");
-  }
-  const [luxBal, setLuxBal]               = useState<number>(0);
+  // Default to Marketplace when no wallet — gives newcomers something to browse
+  // immediately, matching the Replit reference layout. We switch back to Owned
+  // NFTs once a wallet is connected and the user actually owns miners.
+  const [subTab, setSubTab]               = useState<"owned" | "shop">(eoaAddr ? "owned" : "shop");
+  const persistEoa = setEoaAddr;
   const [miners, setMiners]               = useState<MinerGrp[]>([]);
   const [listings, setListings]           = useState<Listing[]>([]);
   const [listingsLoading, setListingsLoading] = useState(false);
-  const [showWalletModal, setShowWalletModal] = useState(false);
+  const setShowWalletModal = (open: boolean) => { if (open) openWalletModal(); };
   const [buyTarget, setBuyTarget]         = useState<{ listing: Listing; meta: MinerMeta & { tokenId: string } } | null>(null);
   const [withdrawing, setWithdrawing]     = useState(false);
   const [withdrawMsg, setWithdrawMsg]     = useState<string | null>(null);
   const [togglingKey, setTogglingKey]     = useState<string | null>(null);
   const [nowMs, setNowMs]                 = useState(Date.now());
   const [nftLoadErr, setNftLoadErr]       = useState<string | null>(null);
+  const prevEoaRef                        = useRef<string | null>(eoaAddr);
 
   useEffect(() => {
     const id = setInterval(() => setNowMs(Date.now()), 1000);
@@ -1184,12 +1571,24 @@ function MiningScreen({
     loadListings();
   }, []);
 
-  // Restore wallet session: if eoaAddr was saved (user switched tabs), reload LUX balance + miners
+  // Reload LUX balance + owned NFTs whenever the connected wallet changes.
+  // If the wallet was just connected (null → addr), default the marketplace tab
+  // to "shop" so the user can browse — switched back to "owned" if NFTs exist.
   useEffect(() => {
-    if (!eoaAddr) return;
+    if (!eoaAddr) {
+      setMiners([]);
+      prevEoaRef.current = null;
+      // No wallet: force Marketplace as the visible tab so the user always sees
+      // the miner catalog (matches Replit reference).
+      setSubTab("shop");
+      return;
+    }
+    const justConnected = prevEoaRef.current !== eoaAddr;
+    prevEoaRef.current = eoaAddr;
     const addr = eoaAddr;
+    if (justConnected) setSubTab("shop");
+    setNftLoadErr(null);
     getLuxBalance(addr).then(setLuxBal).catch(() => {});
-    // Reload NFT miners list so Owned tab is populated after tab switch
     (async () => {
       try {
         const tokenIds = ["4", "5", "6", "7"];
@@ -1198,14 +1597,17 @@ function MiningScreen({
           .map((id, i) => ({ tokenId: id, count: balances[i] }))
           .filter(n => n.count > 0);
         if (nftMiners.length === 0) return;
-        const data = await apiPost<MinerGrp[]>(`${API_BASE}/miners`, {
+        const data = await apiPost<MinerGrp[]>(api("miners"), {
           walletAddress: addr,
           nftMiners: JSON.stringify(nftMiners),
         });
-        if (data !== null) setMiners(Array.isArray(data) ? data : JSON.parse(data as unknown as string));
-      } catch {}
+        if (data !== null) {
+          setMiners(Array.isArray(data) ? data : JSON.parse(data as unknown as string));
+          if (justConnected) setSubTab("owned");
+        }
+      } catch { setNftLoadErr("Failed to load NFTs from chain"); }
     })();
-  }, []); // run once on mount only
+  }, [eoaAddr, setLuxBal]);
 
   async function loadListings() {
     setListingsLoading(true);
@@ -1237,41 +1639,6 @@ function MiningScreen({
     return Math.floor(gemsPerDay * elapsed);
   }
 
-  async function onWalletConnected(addr: string) {
-    setShowWalletModal(false);
-    persistEoa(addr);
-    setNftLoadErr(null);
-
-    // Go to marketplace immediately so user can browse/buy while data loads
-    setSubTab("shop");
-
-    // Load LUX balance in background
-    getLuxBalance(addr).then(setLuxBal).catch(() => {});
-
-    // Load NFT balances — if user has NFTs switch back to "owned"
-    try {
-      const tokenIds = ["4", "5", "6", "7"];
-      const balances = await Promise.all(tokenIds.map(id => getNftBalance(addr, Number(id))));
-      const nftMiners: NftMiner[] = tokenIds
-        .map((id, i) => ({ tokenId: id, count: balances[i] }))
-        .filter(n => n.count > 0);
-
-      if (nftMiners.length > 0) {
-        const data = await apiPost<MinerGrp[]>(`${API_BASE}/miners`, {
-          walletAddress: addr,
-          nftMiners: JSON.stringify(nftMiners),
-        });
-        if (data !== null) {
-          setMiners(Array.isArray(data) ? data : JSON.parse(data as unknown as string));
-          // Has NFTs → switch to owned miners view
-          setSubTab("owned");
-        }
-      }
-    } catch {
-      // NFT check failed — user stays on marketplace (already set above)
-    }
-  }
-
   async function refreshMiners() {
     if (!eoaAddr) return;
     try {
@@ -1281,7 +1648,7 @@ function MiningScreen({
         .map((id, i) => ({ tokenId: id, count: balances[i] }))
         .filter(n => n.count > 0);
       if (nftMiners.length === 0) { setMiners([]); return; }
-      const data = await apiPost<MinerGrp[]>(`${API_BASE}/miners`, {
+      const data = await apiPost<MinerGrp[]>(api("miners"), {
         walletAddress: eoaAddr,
         nftMiners: JSON.stringify(nftMiners),
       });
@@ -1295,7 +1662,7 @@ function MiningScreen({
     const key = `${tokenId}-${minerIndex}`;
     if (togglingKey === key) return;
     setTogglingKey(key);
-    const data = await apiPost<MinerInst>(`${API_BASE}/set-miner-active`, {
+    const data = await apiPost<MinerInst>(api("set-miner-active"), {
       walletAddress: eoaAddr,
       minerId: tokenId,
       minerIndex,
@@ -1319,18 +1686,18 @@ function MiningScreen({
     const balances = await Promise.all(tokenIds.map(id => getNftBalance(eoaAddr, Number(id)).catch(() => 0)));
     const nftMiners: NftMiner[] = tokenIds.map((id, i) => ({ tokenId: id, count: balances[i] })).filter(n => n.count > 0);
 
-    const earned = await apiPost<number>(`${API_BASE}/withdrawal-miners`, {
+    const earned = await apiPost<number>(api("withdrawal-miners"), {
       telegram,
       walletAddress: eoaAddr,
       nftMiners: JSON.stringify(nftMiners),
     });
     if (earned !== null) {
-      const data = await apiPost<MinerGrp[]>(`${API_BASE}/miners`, {
+      const data = await apiPost<MinerGrp[]>(api("miners"), {
         walletAddress: eoaAddr,
         nftMiners: JSON.stringify(nftMiners),
       });
       if (data !== null) setMiners(Array.isArray(data) ? data : JSON.parse(data as unknown as string));
-      const user = await apiPost<UserData>(`${API_BASE}/user`, { telegram });
+      const user = await apiPost<UserData>(api("user"), { telegram });
       if (user) onScoreUpdate(user.score, undefined);
       const n = typeof earned === "number" ? earned : Number(earned);
       setWithdrawMsg(n > 0 ? `+${n.toLocaleString("ru-RU")} 💎 добыто!` : "Нет накопленных гемов");
@@ -1384,6 +1751,8 @@ function MiningScreen({
                   _socialWallet = null;
                   sessionStorage.removeItem("lux_social_pk");
                   sessionStorage.removeItem("lux_social_provider");
+                  localStorage.removeItem("lux_social_pk");
+                  localStorage.removeItem("lux_social_provider");
                 }} style={{ fontSize: 10, color: "rgba(255,80,80,0.6)", background: "none", border: "1px solid rgba(255,80,80,0.2)", borderRadius: 8, padding: "4px 10px", cursor: "pointer" }}>
                   Disconnect
                 </button>
@@ -1631,8 +2000,7 @@ function MiningScreen({
         </div>
       )}
 
-      {/* ── Modals ── */}
-      {showWalletModal && <WalletModal onConnect={onWalletConnected} onClose={() => setShowWalletModal(false)} />}
+      {/* ── Modals (WalletModal lifted to root; only marketplace-specific BuyModal stays here) ── */}
       {buyTarget && eoaAddr && (
         <BuyModal
           listing={buyTarget.listing}
@@ -1647,33 +2015,223 @@ function MiningScreen({
   );
 }
 
+/* ─── EXCHANGE MODAL ─────────────────────────────────────────── */
+function ExchangeModal({
+  config, telegram, gems, gold, onClose, onExchanged,
+}: {
+  config: GameConfig;
+  telegram: string;
+  gems: number;
+  gold: number;
+  onClose: () => void;
+  onExchanged: (score: number, gold: number) => void;
+}) {
+  const rate = config.exchangeGemsPerGold;
+  const maxGold = Math.floor(gems / rate);
+  const [goldQty, setGoldQty] = useState<number>(maxGold > 0 ? 1 : 0);
+  const [busy, setBusy]       = useState(false);
+  const [err, setErr]         = useState<string | null>(null);
+  const [msg, setMsg]         = useState<string | null>(null);
+
+  const gemsNeeded = goldQty * rate;
+  const canSubmit  = goldQty >= 1 && gemsNeeded <= gems && !busy;
+
+  async function submit() {
+    if (!canSubmit) return;
+    setBusy(true); setErr(null);
+    const res = await apiPost<{ score: number; gold: number; exchanged: number }>(
+      api("exchange-gold"), { telegram, gems: gemsNeeded }
+    );
+    setBusy(false);
+    if (!res) { setErr("Exchange failed. Try again."); return; }
+    setMsg(`+${res.exchanged.toLocaleString("ru-RU")} ◈ Gold`);
+    onExchanged(res.score, res.gold);
+    setTimeout(onClose, 1200);
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 50, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} className="glass-strong" style={{ width: "100%", maxWidth: 340, borderRadius: 24, padding: "22px 20px", border: "1px solid rgba(255,215,0,0.3)", boxShadow: "0 0 50px rgba(255,180,0,0.18)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <p style={{ fontSize: 14, fontWeight: 800, color: "#ffd700", textShadow: "0 0 10px #ffd70055" }}>⇄ Exchange Gems → Gold</p>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "rgba(255,255,255,0.4)", fontSize: 18, cursor: "pointer" }}>×</button>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
+          <div style={{ background: "rgba(199,125,255,0.05)", border: "1px solid rgba(199,125,255,0.15)", borderRadius: 12, padding: "10px 12px" }}>
+            <p style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", marginBottom: 3 }}>You have</p>
+            <p style={{ fontSize: 14, fontWeight: 700, color: "#c77dff" }}>{gems.toLocaleString("ru-RU")} 💎</p>
+          </div>
+          <div style={{ background: "rgba(255,215,0,0.05)", border: "1px solid rgba(255,215,0,0.15)", borderRadius: 12, padding: "10px 12px" }}>
+            <p style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", marginBottom: 3 }}>Gold</p>
+            <p style={{ fontSize: 14, fontWeight: 700, color: "#ffd700" }}>{gold.toLocaleString("ru-RU")} ◈</p>
+          </div>
+        </div>
+
+        <p style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", marginBottom: 6 }}>Rate · {rate.toLocaleString("ru-RU")} 💎 = 1 ◈</p>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <button onClick={() => setGoldQty(q => Math.max(1, q - 1))} className="lux-btn" style={{ width: 36, height: 36, padding: 0, borderRadius: 10, fontSize: 18, fontWeight: 700 }} disabled={busy}>−</button>
+          <input
+            type="number" min={1} max={maxGold} value={goldQty}
+            onChange={e => setGoldQty(Math.max(1, Math.min(maxGold || 1, Math.floor(Number(e.target.value) || 1))))}
+            style={{ flex: 1, textAlign: "center", padding: "10px 12px", borderRadius: 10, background: "rgba(255,215,0,0.05)", border: "1px solid rgba(255,215,0,0.2)", color: "#ffd700", fontSize: 16, fontWeight: 700 }}
+            disabled={busy || maxGold === 0}
+          />
+          <button onClick={() => setGoldQty(q => Math.min(maxGold, q + 1))} className="lux-btn" style={{ width: 36, height: 36, padding: 0, borderRadius: 10, fontSize: 18, fontWeight: 700 }} disabled={busy}>+</button>
+          <button onClick={() => setGoldQty(maxGold)} className="lux-btn" style={{ padding: "9px 12px", borderRadius: 10, fontSize: 11, fontWeight: 700 }} disabled={busy || maxGold === 0}>Max</button>
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "rgba(255,255,255,0.5)", marginBottom: 12 }}>
+          <span>Cost</span>
+          <span style={{ color: gemsNeeded > gems ? "#ff6b6b" : "#fff", fontWeight: 700 }}>{gemsNeeded.toLocaleString("ru-RU")} 💎</span>
+        </div>
+
+        {err && <p style={{ fontSize: 11, color: "#ff6b6b", textAlign: "center", marginBottom: 10 }}>{err}</p>}
+        {msg && <p style={{ fontSize: 12, color: "#4ade80", textAlign: "center", marginBottom: 10, fontWeight: 700 }}>{msg}</p>}
+
+        <button onClick={submit} disabled={!canSubmit} className="lux-btn" style={{ width: "100%", padding: "12px 0", borderRadius: 14, fontSize: 13, fontWeight: 800, color: "#ffd700", border: "1px solid rgba(255,215,0,0.4)", background: "linear-gradient(135deg, rgba(255,180,0,0.18), rgba(255,215,0,0.22))", opacity: canSubmit ? 1 : 0.5 }}>
+          {busy ? "Exchanging…" : maxGold === 0 ? "Insufficient gems" : `Exchange for ${goldQty} ◈`}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ─── REFERRALS MODAL ────────────────────────────────────────── */
+function ReferralsModal({
+  telegram, onClose, onActivated,
+}: {
+  telegram: string;
+  onClose: () => void;
+  onActivated: (score: number) => void;
+}) {
+  const [info, setInfo]    = useState<RefInfo | null>(null);
+  const [code, setCode]    = useState("");
+  const [busy, setBusy]    = useState(false);
+  const [msg, setMsg]      = useState<string | null>(null);
+  const [err, setErr]      = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!telegram) return;
+    apiPost<RefInfo>(api("referral-info"), { telegram }).then(d => { if (d) setInfo(d); });
+  }, [telegram]);
+
+  async function copyCode() {
+    if (!info?.code) return;
+    try { await navigator.clipboard.writeText(info.code); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {}
+  }
+
+  async function activate() {
+    if (!code.trim() || busy) return;
+    setBusy(true); setErr(null); setMsg(null);
+    const res = await apiPost<{ invitedBy: string; bonusAwarded: number }>(api("activate-referral"), { telegram, code: code.trim() });
+    setBusy(false);
+    if (!res) { setErr("Invalid or already used code."); return; }
+    setMsg(`Linked to ${res.invitedBy}. Inviter received +${res.bonusAwarded.toLocaleString("ru-RU")} 💎`);
+    const refreshed = await apiPost<RefInfo>(api("referral-info"), { telegram });
+    if (refreshed) setInfo(refreshed);
+    const user = await apiPost<UserData>(api("user"), { telegram });
+    if (user) onActivated(user.score);
+    setCode("");
+  }
+
+  const tgLink = info?.code ? `https://t.me/${TG_BOT_USERNAME}?start=${info.code}` : "";
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 50, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} className="glass-strong" style={{ width: "100%", maxWidth: 340, borderRadius: 24, padding: "22px 20px", border: "1px solid rgba(0,212,255,0.3)", boxShadow: "0 0 50px rgba(0,212,255,0.18)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <p style={{ fontSize: 14, fontWeight: 800, color: "#00d4ff", textShadow: "0 0 10px #00d4ff55" }}>◎ Referrals</p>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "rgba(255,255,255,0.4)", fontSize: 18, cursor: "pointer" }}>×</button>
+        </div>
+
+        <p style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginBottom: 12 }}>Your referral code</p>
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <div style={{ flex: 1, padding: "10px 12px", borderRadius: 10, background: "rgba(0,212,255,0.06)", border: "1px solid rgba(0,212,255,0.2)", fontSize: 14, fontWeight: 800, color: "#00d4ff", textAlign: "center", letterSpacing: "0.08em" }}>
+            {info?.code ?? "…"}
+          </div>
+          <button onClick={copyCode} className="lux-btn" style={{ padding: "0 14px", borderRadius: 10, fontSize: 11, fontWeight: 700 }}>{copied ? "Copied!" : "Copy"}</button>
+        </div>
+
+        {tgLink && (
+          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", textAlign: "center", marginBottom: 14, wordBreak: "break-all" }}>{tgLink}</div>
+        )}
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 16 }}>
+          <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 12, padding: "10px 12px", border: "1px solid rgba(255,255,255,0.05)" }}>
+            <p style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", marginBottom: 3 }}>Invited</p>
+            <p style={{ fontSize: 16, fontWeight: 800, color: "#00d4ff" }}>{info?.invitedCount ?? 0}</p>
+          </div>
+          <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 12, padding: "10px 12px", border: "1px solid rgba(255,255,255,0.05)" }}>
+            <p style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", marginBottom: 3 }}>Bonus / invite</p>
+            <p style={{ fontSize: 16, fontWeight: 800, color: "#c77dff" }}>{(info?.bonusPerInvite ?? 50000).toLocaleString("ru-RU")} 💎</p>
+          </div>
+        </div>
+
+        <p style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginBottom: 8 }}>Have a friend's code?</p>
+        {info?.invitedBy ? (
+          <div style={{ padding: "10px 12px", borderRadius: 10, background: "rgba(74,222,128,0.05)", border: "1px solid rgba(74,222,128,0.2)", fontSize: 11, color: "#4ade80" }}>
+            ✓ You were invited by <b>{info.invitedBy}</b>
+          </div>
+        ) : (
+          <>
+            <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+              <input
+                value={code}
+                onChange={e => setCode(e.target.value.toUpperCase())}
+                placeholder="LUX-XXXXX"
+                style={{ flex: 1, padding: "10px 12px", borderRadius: 10, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.1)", color: "#fff", fontSize: 13, fontWeight: 600, letterSpacing: "0.05em", textAlign: "center" }}
+                disabled={busy}
+              />
+              <button onClick={activate} disabled={busy || !code.trim()} className="lux-btn" style={{ padding: "0 14px", borderRadius: 10, fontSize: 11, fontWeight: 700, opacity: busy || !code.trim() ? 0.5 : 1 }}>
+                {busy ? "…" : "Apply"}
+              </button>
+            </div>
+            {err && <p style={{ fontSize: 11, color: "#ff6b6b", textAlign: "center" }}>{err}</p>}
+            {msg && <p style={{ fontSize: 11, color: "#4ade80", textAlign: "center" }}>{msg}</p>}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ─── TASKS ──────────────────────────────────────────────────── */
 function TasksScreen({
-  config, telegram, userData, onScoreUpdate,
+  config, telegram, userData, onScoreUpdate, openReferrals,
 }: {
   config: GameConfig;
   telegram: string;
   userData: UserData | null;
   onScoreUpdate: (s: number, lastDaily?: string | null) => void;
+  openReferrals: () => void;
 }) {
   const [claimBusy, setClaimBusy] = useState(false);
   const [claimMsg,  setClaimMsg]  = useState<string | null>(null);
+  const [tasks, setTasks]         = useState<TaskRow[]>([]);
+  const [taskBusyId, setTaskBusyId] = useState<string | null>(null);
 
   const lastDaily = userData?.lastDailyReward ?? null;
   const canClaim  = !lastDaily || (Date.now() - new Date(lastDaily).getTime()) / 1000 >= config.dailyRewardTime;
 
   const daily     = config.dailyReward.toLocaleString("ru-RU");
   const cooldownH = Math.round(config.dailyRewardTime / 3600);
-  const tasks = [
-    { text: "Click 100 times",      reward: "500 💎",    done: true },
-    { text: "Login 7 days in a row", reward: "2,000 💎",  done: false },
-    { text: "Invite 1 friend",       reward: "50,000 💎", done: false },
-  ];
+
+  // Fetch tasks once on mount and again whenever score/userData changes (so
+  // progress reflects fresh clicks_today / login_days / invited_count).
+  useEffect(() => {
+    if (!telegram) return;
+    apiPost<{ tasks: TaskRow[]; score: number }>(api("tasks"), { telegram }).then(d => {
+      if (d) setTasks(d.tasks);
+    });
+  }, [telegram, userData?.score, userData?.invitedCount, userData?.loginDays]);
 
   async function handleClaim() {
     if (!canClaim || claimBusy || !telegram) return;
     setClaimBusy(true);
-    const res = await apiPost<{ score: number; reward: number }>(`${API_BASE}/claim-daily`, { telegram });
+    const res = await apiPost<{ score: number; reward: number }>(api("claim-daily"), { telegram });
     if (res) {
       const ts = new Date().toISOString();
       onScoreUpdate(res.score, ts);
@@ -1681,6 +2239,21 @@ function TasksScreen({
       setTimeout(() => setClaimMsg(null), 3500);
     }
     setClaimBusy(false);
+  }
+
+  async function claimTask(taskId: string) {
+    if (!telegram || taskBusyId) return;
+    setTaskBusyId(taskId);
+    const res = await apiPost<{ score: number; reward: number; taskId: string }>(
+      api("claim-task"), { telegram, taskId }
+    );
+    if (res) {
+      onScoreUpdate(res.score, undefined);
+      // Refresh tasks so claimed=true is reflected
+      const fresh = await apiPost<{ tasks: TaskRow[]; score: number }>(api("tasks"), { telegram });
+      if (fresh) setTasks(fresh.tasks);
+    }
+    setTaskBusyId(null);
   }
 
   return (
@@ -1710,7 +2283,7 @@ function TasksScreen({
         </div>
       </div>
 
-      {/* Referrals */}
+      {/* Referrals teaser */}
       <div className="glass" style={{ borderRadius: 20, padding: "16px 18px" }}>
         <p style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginBottom: 12 }}>Приглашай друзей — получай бонусы</p>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 12 }}>
@@ -1721,20 +2294,47 @@ function TasksScreen({
             </div>
           ))}
         </div>
-        <button className="lux-btn" style={{ width: "100%", padding: "10px 0", borderRadius: 14, fontSize: 12, fontWeight: 700 }}>⊕ Invite Friend</button>
+        <button onClick={openReferrals} className="lux-btn" style={{ width: "100%", padding: "10px 0", borderRadius: 14, fontSize: 12, fontWeight: 700 }}>⊕ Invite Friend</button>
       </div>
 
       {/* Tasks list */}
       <div className="glass" style={{ borderRadius: 20, padding: "16px 18px" }}>
         <p style={{ fontSize: 10, letterSpacing: "0.15em", color: "rgba(255,255,255,0.3)", marginBottom: 12 }}>DAILY TASKS</p>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {tasks.map((t, i) => (
-            <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 12, background: t.done ? "rgba(74,222,128,0.05)" : "rgba(255,255,255,0.02)", border: t.done ? "1px solid rgba(74,222,128,0.15)" : "1px solid rgba(255,255,255,0.05)", cursor: "pointer" }}>
-              <span style={{ fontSize: 14 }}>{t.done ? "✅" : "⬜"}</span>
-              <span style={{ flex: 1, fontSize: 11, color: t.done ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.75)" }}>{t.text}</span>
-              <span style={{ fontSize: 11, fontWeight: 700, color: "#ffd700", textShadow: "0 0 10px #ffd70066" }}>{t.reward}</span>
-            </div>
-          ))}
+          {tasks.length === 0 && (
+            <p style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", textAlign: "center", padding: "12px 0" }}>Loading…</p>
+          )}
+          {tasks.map(t => {
+            const complete = t.progress >= t.target;
+            const pct = Math.min(100, Math.round((t.progress / t.target) * 100));
+            const busy = taskBusyId === t.id;
+            return (
+              <div key={t.id} style={{ padding: "10px 12px", borderRadius: 12, background: t.claimed ? "rgba(74,222,128,0.05)" : complete ? "rgba(255,215,0,0.05)" : "rgba(255,255,255,0.02)", border: t.claimed ? "1px solid rgba(74,222,128,0.2)" : complete ? "1px solid rgba(255,215,0,0.25)" : "1px solid rgba(255,255,255,0.05)" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+                  <span style={{ fontSize: 14 }}>{t.claimed ? "✅" : complete ? "🎁" : "⬜"}</span>
+                  <span style={{ flex: 1, fontSize: 11, color: t.claimed ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.75)" }}>{t.label}</span>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: "#ffd700", textShadow: "0 0 10px #ffd70066" }}>{t.reward.toLocaleString("ru-RU")} 💎</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ flex: 1, height: 4, borderRadius: 4, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
+                    <div style={{ width: `${pct}%`, height: "100%", background: complete ? "linear-gradient(90deg,#ffd700,#ff9800)" : "linear-gradient(90deg,#00d4ff,#7c3aed)", transition: "width 0.3s" }} />
+                  </div>
+                  <span style={{ fontSize: 10, color: "rgba(255,255,255,0.5)", minWidth: 50, textAlign: "right" }}>{t.progress}/{t.target}</span>
+                  {t.claimed ? (
+                    <span style={{ fontSize: 10, color: "#4ade80", fontWeight: 700, minWidth: 50, textAlign: "center" }}>Claimed</span>
+                  ) : complete ? (
+                    <button onClick={() => claimTask(t.id)} disabled={busy} className="lux-btn" style={{ padding: "5px 12px", borderRadius: 9, fontSize: 10, fontWeight: 700, color: "#ffd700", border: "1px solid rgba(255,215,0,0.4)", background: "rgba(255,215,0,0.1)", opacity: busy ? 0.5 : 1 }}>
+                      {busy ? "…" : "Claim"}
+                    </button>
+                  ) : (t.id === "invite1" || t.id === "invite3" || t.id === "invite5") ? (
+                    <button onClick={openReferrals} className="lux-btn" style={{ padding: "5px 10px", borderRadius: 9, fontSize: 10, fontWeight: 700, minWidth: 50 }}>Go</button>
+                  ) : (
+                    <span style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", minWidth: 50, textAlign: "center" }}>—</span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>
@@ -1742,13 +2342,48 @@ function TasksScreen({
 }
 
 /* ─── PROFILE ────────────────────────────────────────────────── */
-function ProfileScreen({ tgUser, config, userData }: { tgUser: TgUser | null; config: GameConfig; userData: UserData | null }) {
+function ProfileScreen({
+  tgUser, config, userData, eoaAddr, setEoaAddr, luxBal, setLuxBal, openWalletModal, openExchange, openReferrals,
+}: {
+  tgUser: TgUser | null;
+  config: GameConfig;
+  userData: UserData | null;
+  eoaAddr: string | null;
+  setEoaAddr: (addr: string | null) => void;
+  luxBal: number;
+  setLuxBal: (n: number) => void;
+  openWalletModal: () => void;
+  openExchange: () => void;
+  openReferrals: () => void;
+}) {
   const displayName = tgUser?.username
     ? `@${tgUser.username}`
     : tgUser?.first_name ?? "LUXury_CEO";
 
   const gems = userData?.score ?? 0;
-  const gold = Math.floor(gems / config.exchangeGemsPerGold);
+  const gold = userData?.gold ?? 0;
+  const shortAddr = eoaAddr ? `${eoaAddr.slice(0, 6)}…${eoaAddr.slice(-4)}` : null;
+
+  // Live referral info — refreshed every time the Profile screen mounts so
+  // the invited-friends counter reflects any referral activated on Tasks
+  // or via the Referrals modal in another tab.
+  const [refInfo, setRefInfo] = useState<RefInfo | null>(null);
+  const telegram = userData?.telegram;
+  useEffect(() => {
+    if (!telegram) return;
+    apiPost<RefInfo>(api("referral-info"), { telegram }).then(d => {
+      if (d) setRefInfo(d);
+    });
+  }, [telegram, userData?.invitedCount]);
+
+  function disconnect() {
+    setEoaAddr(null);
+    setLuxBal(0);
+    sessionStorage.removeItem("lux_social_pk");
+    sessionStorage.removeItem("lux_social_provider");
+    localStorage.removeItem("lux_social_pk");
+    localStorage.removeItem("lux_social_provider");
+  }
 
   return (
     <div className="slide-in" style={{ flex: 1, display: "flex", flexDirection: "column", padding: "20px 16px 100px", gap: 12, overflowY: "auto" }}>
@@ -1757,7 +2392,7 @@ function ProfileScreen({ tgUser, config, userData }: { tgUser: TgUser | null; co
         <div style={{ width: 80, height: 80, borderRadius: "50%", background: "radial-gradient(circle at 40% 35%, rgba(0,212,255,0.6) 0%, rgba(100,40,200,0.8) 60%, rgba(10,0,40,0.95) 100%)", border: "2px solid rgba(0,212,255,0.4)", boxShadow: "0 0 30px rgba(0,212,255,0.35)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 36, marginBottom: 10 }}>👤</div>
         <p style={{ fontSize: 20, fontWeight: 800, color: "#00d4ff", textShadow: "0 0 12px #00d4ff88" }}>{displayName}</p>
         <p style={{ fontSize: 11, color: "rgba(255,255,255,0.2)", marginTop: 2 }}>
-          {tgUser?.id ? `Telegram ID: ${tgUser.id}` : "Telegram · @LUX_Clicker_bot"}
+          {tgUser?.id ? `Telegram ID: ${tgUser.id}` : `Telegram · @${TG_BOT_USERNAME}`}
         </p>
       </div>
 
@@ -1780,27 +2415,51 @@ function ProfileScreen({ tgUser, config, userData }: { tgUser: TgUser | null; co
       </div>
 
       {/* Wallet */}
-      <div className="glass" style={{ borderRadius: 20, padding: "16px 18px", border: "1px solid rgba(255,80,80,0.15)" }}>
+      <div className="glass" style={{ borderRadius: 20, padding: "16px 18px", border: eoaAddr ? "1px solid rgba(74,222,128,0.2)" : "1px solid rgba(255,80,80,0.15)" }}>
         <p style={{ fontSize: 10, letterSpacing: "0.15em", color: "rgba(255,255,255,0.25)", marginBottom: 10 }}>WALLET</p>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <p style={{ fontSize: 12, color: "rgba(255,100,100,0.6)" }}>Not connected</p>
-          <button className="lux-btn" style={{ padding: "8px 18px", borderRadius: 12, fontSize: 11, fontWeight: 700 }}>Connect</button>
-        </div>
+        {eoaAddr ? (
+          <>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+              <div>
+                <p style={{ fontSize: 12, color: "#4ade80", fontWeight: 700 }}>{shortAddr}</p>
+                <p style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginTop: 2 }}>Polygon · Connected</p>
+              </div>
+              <button onClick={disconnect} className="lux-btn" style={{ padding: "7px 14px", borderRadius: 10, fontSize: 10, fontWeight: 700, color: "rgba(255,100,100,0.8)", border: "1px solid rgba(255,100,100,0.3)" }}>Disconnect</button>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 6 }}>
+              <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 10, padding: "8px 12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <p style={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}>LUX balance</p>
+                <p style={{ fontSize: 12, color: "#c77dff", fontWeight: 700 }}>{luxBal.toLocaleString("ru-RU", { maximumFractionDigits: 2 })} LUX</p>
+              </div>
+            </div>
+          </>
+        ) : (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <p style={{ fontSize: 12, color: "rgba(255,100,100,0.6)" }}>Not connected</p>
+            <button onClick={openWalletModal} className="lux-btn" style={{ padding: "8px 18px", borderRadius: 12, fontSize: 11, fontWeight: 700 }}>Connect</button>
+          </div>
+        )}
       </div>
 
       {/* Actions */}
-      {[
-        { icon: "⇄", title: "Exchange Gems → Gold", sub: `${config.exchangeGemsPerGold.toLocaleString("ru-RU")} 💎 = 1 ◈ Gold` },
-        { icon: "◎", title: "Referrals", sub: "Пригласи друзей" },
-      ].map(a => (
-        <button key={a.title} className="lux-btn" style={{ width: "100%", padding: "14px 18px", borderRadius: 16, textAlign: "left", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <div>
-            <p style={{ fontSize: 13, fontWeight: 700, color: "#fff", marginBottom: 2 }}>{a.icon} {a.title}</p>
-            <p style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>{a.sub}</p>
-          </div>
-          <span style={{ color: "rgba(0,212,255,0.5)", fontSize: 16 }}>›</span>
-        </button>
-      ))}
+      <button onClick={openExchange} className="lux-btn" style={{ width: "100%", padding: "14px 18px", borderRadius: 16, textAlign: "left", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div>
+          <p style={{ fontSize: 13, fontWeight: 700, color: "#fff", marginBottom: 2 }}>⇄ Exchange Gems → Gold</p>
+          <p style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>{config.exchangeGemsPerGold.toLocaleString("ru-RU")} 💎 = 1 ◈ Gold</p>
+        </div>
+        <span style={{ color: "rgba(0,212,255,0.5)", fontSize: 16 }}>›</span>
+      </button>
+      <button onClick={openReferrals} className="lux-btn" style={{ width: "100%", padding: "14px 18px", borderRadius: 16, textAlign: "left", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div>
+          <p style={{ fontSize: 13, fontWeight: 700, color: "#fff", marginBottom: 2 }}>◎ Referrals</p>
+          <p style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>
+            {refInfo
+              ? `Приглашено: ${refInfo.invitedCount} · +${(refInfo.bonusPerInvite / 1000).toFixed(0)}K 💎 за каждого`
+              : "Пригласи друзей · +50K 💎 за каждого"}
+          </p>
+        </div>
+        <span style={{ color: "rgba(0,212,255,0.5)", fontSize: 16 }}>›</span>
+      </button>
     </div>
   );
 }
@@ -1814,9 +2473,25 @@ export function LuxUI() {
   const [tgUser, setTgUser]     = useState<TgUser | null>(null);
   const [userData, setUserData] = useState<UserData | null>(null);
 
+  // ── Shared wallet state (Mining + Profile both observe this) ───
+  const [eoaAddr, setEoaAddr] = useSyncedSessionString("lux_eoa");
+  const [luxBal, setLuxBal]   = useState<number>(0);
+
+  // ── Modal state lifted to root ─────────────────────────────────
+  const [showWalletModal,    setShowWalletModal]    = useState(false);
+  const [showExchangeModal,  setShowExchangeModal]  = useState(false);
+  const [showReferralsModal, setShowReferralsModal] = useState(false);
+
+  // Whenever the connected wallet changes (incl. Profile→Connect), refresh
+  // the LUX balance shown on Profile.
+  useEffect(() => {
+    if (!eoaAddr) { setLuxBal(0); return; }
+    getLuxBalance(eoaAddr).then(setLuxBal).catch(() => {});
+  }, [eoaAddr]);
+
   // ── Fetch game config on mount ──────────────────────────────────
   useEffect(() => {
-    const BACKEND = `${API_BASE}/game-config`;
+    const BACKEND = api("game-config");
     const STATIC  = `${import.meta.env.BASE_URL}miners-config.json`;
 
     const parseConfig = (raw: unknown): GameConfig => {
@@ -1840,11 +2515,18 @@ export function LuxUI() {
       .catch(() => fetch(STATIC).then(r => r.json()).then(applyResponse).catch(() => {}));
   }, []);
 
-  // ── Detect Telegram context (no auto-login — user must press button) ─
+  // ── Detect Telegram WebApp context + expand viewport ──────────────
   useEffect(() => {
     const tg = (window as any).Telegram?.WebApp;
     if (!tg) return;
-    tg.ready();
+    try {
+      tg.ready();
+      tg.expand?.();
+      // Theme the Telegram chrome to match the app's dark background so the
+      // status-bar / header don't show as a stark light strip.
+      tg.setHeaderColor?.("#000000");
+      tg.setBackgroundColor?.("#000000");
+    } catch { /* older Telegram clients */ }
     const user: TgUser | undefined = tg.initDataUnsafe?.user;
     if (user?.id) setTgUser(user);
   }, []);
@@ -1854,7 +2536,7 @@ export function LuxUI() {
 
   async function handleLogin(telegramId: string) {
     setLoginError(null);
-    const data = await apiPost<UserData>(`${API_BASE}/user`, { telegram: telegramId });
+    const data = await apiPost<UserData>(api("user"), { telegram: telegramId });
     if (data) {
       setUserData(data);
       setAuthed(true);
@@ -1862,6 +2544,17 @@ export function LuxUI() {
       setLoginError("Backend unavailable. Try again.");
     }
   }
+
+  // ── Auto-login when running inside a Telegram Mini App ──────────
+  // initDataUnsafe.user is populated by Telegram for every Mini App launch,
+  // so the player should never see the AuthScreen inside Telegram — we log
+  // them in straight away with their real Telegram ID.
+  useEffect(() => {
+    if (authed) return;
+    if (!tgUser?.id) return;
+    handleLogin(String(tgUser.id));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tgUser?.id, authed]);
 
   // ── Shared score+lastDaily updater ─────────────────────────────
   function handleScoreUpdate(score: number, lastDailyReward?: string | null) {
@@ -1872,14 +2565,40 @@ export function LuxUI() {
     } : u);
   }
 
+  // ── Refresh full userData from backend (used on tab switch) ────
+  // Pulls the canonical row so gold/invitedCount/loginDays/clicksToday
+  // stay in sync after actions done on other tabs (claim task, referral
+  // activation, exchange, etc.).
+  async function refreshUserData() {
+    if (!userData?.telegram) return;
+    const fresh = await apiPost<UserData>(api("user"), { telegram: userData.telegram });
+    if (fresh) setUserData(fresh);
+  }
+
+  // When the user navigates to Profile or Tasks, refresh once so they see
+  // fresh balances/streaks/invite counts without having to relogin.
+  useEffect(() => {
+    if (!authed) return;
+    if (tab === "profile" || tab === "tasks") {
+      refreshUserData();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, authed]);
+
+  // Responsive: on mobile (narrow viewport) or inside Telegram Mini App,
+  // fill the whole viewport without the desktop phone-mockup frame. The
+  // 390×780 framed mode is only used on wide desktop screens.
+  const isCompact = useIsCompactViewport(!!tgUser);
+  const frameStyle: React.CSSProperties = isCompact
+    ? { width: "100vw", height: "100dvh", maxWidth: "100vw", maxHeight: "100dvh", borderRadius: 0, border: "none", boxShadow: "none", overflow: "hidden", position: "relative" }
+    : { width: 390, height: 780, borderRadius: 44, overflow: "hidden", position: "relative", border: "1.5px solid rgba(0,212,255,0.2)", boxShadow: "0 0 0 1px rgba(0,0,0,0.8), 0 0 60px rgba(0,212,255,0.15), 0 0 120px rgba(124,58,237,0.1), 0 40px 80px rgba(0,0,0,0.8)" };
+  const rootStyle: React.CSSProperties = isCompact
+    ? { width: "100vw", height: "100dvh", background: "#000", display: "flex", justifyContent: "center", alignItems: "stretch" }
+    : { width: "100vw", height: "100vh", background: "#000", display: "flex", justifyContent: "center", alignItems: "center" };
+
   return (
-    <div className="lux-root" style={{ width: "100vw", height: "100vh", background: "#000", display: "flex", justifyContent: "center", alignItems: "center" }}>
-      <div style={{
-        width: 390, height: 780,
-        borderRadius: 44, overflow: "hidden", position: "relative",
-        border: "1.5px solid rgba(0,212,255,0.2)",
-        boxShadow: "0 0 0 1px rgba(0,0,0,0.8), 0 0 60px rgba(0,212,255,0.15), 0 0 120px rgba(124,58,237,0.1), 0 40px 80px rgba(0,0,0,0.8)",
-      }}>
+    <div className="lux-root" style={rootStyle}>
+      <div style={frameStyle}>
         <LuxBg />
         <div style={{ position: "relative", zIndex: 10, height: "100%", display: "flex", flexDirection: "column" }}>
           {!authed ? (
@@ -1899,6 +2618,11 @@ export function LuxUI() {
                 <MiningScreen
                   telegram={userData?.telegram ?? ""}
                   onScoreUpdate={handleScoreUpdate}
+                  eoaAddr={eoaAddr}
+                  setEoaAddr={setEoaAddr}
+                  luxBal={luxBal}
+                  setLuxBal={setLuxBal}
+                  openWalletModal={() => setShowWalletModal(true)}
                 />
               )}
               {tab === "tasks"   && (
@@ -1907,13 +2631,52 @@ export function LuxUI() {
                   telegram={userData?.telegram ?? ""}
                   userData={userData}
                   onScoreUpdate={handleScoreUpdate}
+                  openReferrals={() => setShowReferralsModal(true)}
                 />
               )}
-              {tab === "profile" && <ProfileScreen tgUser={tgUser} config={config} userData={userData} />}
+              {tab === "profile" && (
+                <ProfileScreen
+                  tgUser={tgUser}
+                  config={config}
+                  userData={userData}
+                  eoaAddr={eoaAddr}
+                  setEoaAddr={setEoaAddr}
+                  luxBal={luxBal}
+                  setLuxBal={setLuxBal}
+                  openWalletModal={() => setShowWalletModal(true)}
+                  openExchange={() => setShowExchangeModal(true)}
+                  openReferrals={() => setShowReferralsModal(true)}
+                />
+              )}
               <Nav tab={tab} setTab={setTab} />
             </>
           )}
         </div>
+
+        {/* ── Root-level modals: accessible from any tab ── */}
+        {authed && showWalletModal && (
+          <WalletModal
+            onConnect={(addr) => { setEoaAddr(addr); setShowWalletModal(false); }}
+            onClose={() => setShowWalletModal(false)}
+          />
+        )}
+        {authed && showExchangeModal && userData && (
+          <ExchangeModal
+            config={config}
+            telegram={userData.telegram}
+            gems={userData.score ?? 0}
+            gold={userData.gold ?? 0}
+            onClose={() => setShowExchangeModal(false)}
+            onExchanged={(score, gold) => setUserData(u => u ? { ...u, score, gold } : u)}
+          />
+        )}
+        {authed && showReferralsModal && userData && (
+          <ReferralsModal
+            telegram={userData.telegram}
+            onClose={() => setShowReferralsModal(false)}
+            onActivated={(score) => setUserData(u => u ? { ...u, score } : u)}
+          />
+        )}
       </div>
     </div>
   );

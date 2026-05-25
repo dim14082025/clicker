@@ -1,0 +1,9 @@
+# dependencies
+node_modules/
+
+# runtime state
+data.json
+data.json.tmp
+
+# logs
+*.log
