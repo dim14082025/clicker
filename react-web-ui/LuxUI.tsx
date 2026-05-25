@@ -238,6 +238,41 @@ function useSyncedSessionString(key: string): [string | null, (v: string | null)
   return [val, update];
 }
 
+/* Decides between the desktop "phone-mockup" frame (390x780 with rounded
+   corners) and a viewport-filling mobile/Telegram layout. Compact wins
+   when running inside a Telegram WebApp, on a narrow viewport, or on a
+   coarse-pointer device (mobile/tablet). Re-evaluates on resize. */
+function useIsCompactViewport(forceCompact: boolean): boolean {
+  const compute = () => {
+    if (typeof window === "undefined") return false;
+    if (forceCompact) return true;
+    // The Telegram WebApp SDK creates `window.Telegram.WebApp` even in a
+    // regular desktop browser, so its mere presence is not a reliable
+    // "inside Telegram" signal. The discriminator is initData length:
+    // populated only when Telegram itself opened the page as a Mini App.
+    const tg = (window as any).Telegram?.WebApp;
+    if (tg && typeof tg.initData === "string" && tg.initData.length > 0) return true;
+    const narrow = window.innerWidth < 500;
+    const coarse =
+      typeof navigator !== "undefined" &&
+      /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+    return narrow || coarse;
+  };
+  const [v, setV] = useState<boolean>(compute);
+  useEffect(() => {
+    const onResize = () => setV(compute());
+    window.addEventListener("resize", onResize);
+    window.addEventListener("orientationchange", onResize);
+    onResize();
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("orientationchange", onResize);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [forceCompact]);
+  return v;
+}
+
 function fmtTime(sec: number): string {
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
@@ -344,10 +379,6 @@ function AuthScreen({
     };
   }, [inTelegram, onLogin]);
 
-  function openBotInTelegram() {
-    window.open(`https://t.me/${TG_BOT_USERNAME}`, "_blank", "noopener,noreferrer");
-  }
-
   async function handleClick() {
     if (!telegramId) return;
     setBusy(true);
@@ -395,13 +426,9 @@ function AuthScreen({
             )}
           </button>
         ) : (
-          /* Regular browser. We render the real Telegram Login Widget AND
-             a guaranteed-working fallback (open-bot link + manual ID input).
-             Telegram unfortunately always renders an iframe even when the
-             bot domain isn't registered, so we can't reliably detect the
-             failure case — hence the always-on fallback. Setting the bot
-             domain via @BotFather → /setdomain will make the widget button
-             appear inside the iframe; until then the fallback is the way in. */
+          /* Regular browser. Show the official Telegram Login Widget, plus
+             a compact manual-ID fallback for QA/testing (e.g. when the
+             tester doesn't want to OAuth through Telegram). */
           <>
             <div
               ref={widgetRef}
@@ -412,27 +439,8 @@ function AuthScreen({
                 width: "100%",
               }}
             />
-
-            <button
-              onClick={openBotInTelegram}
-              disabled={busy}
-              style={{
-                width: "100%", padding: "12px 0", borderRadius: 14,
-                background: "linear-gradient(135deg, #0088cc, #005fa3)",
-                border: "1px solid rgba(0,136,204,0.4)",
-                boxShadow: "0 0 24px rgba(0,136,204,0.35)",
-                cursor: "pointer", display: "flex", alignItems: "center",
-                justifyContent: "center", gap: 8, fontSize: 13,
-                fontWeight: 700, color: "#fff", transition: "all 0.2s",
-              }}
-            >
-              <svg viewBox="0 0 24 24" fill="white" style={{ width: 18, height: 18 }}>
-                <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.03 9.564c-.153.68-.553.847-1.12.527l-3.1-2.285-1.495 1.437c-.165.165-.304.304-.623.304l.223-3.162 5.748-5.192c.25-.222-.054-.345-.388-.123L6.8 14.51l-3.051-.952c-.663-.207-.676-.663.138-.98l11.916-4.595c.55-.2 1.033.134.759.265z" />
-              </svg>
-              Открыть @{TG_BOT_USERNAME} в Telegram
-            </button>
-            <p style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", textAlign: "center", lineHeight: 1.4 }}>
-              Нажми «Start» в боте, затем введи свой Telegram ID ниже
+            <p style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", textAlign: "center", lineHeight: 1.4, margin: "4px 0 -4px" }}>
+              или введи Telegram ID вручную для теста
             </p>
             <div style={{ display: "flex", gap: 8, width: "100%" }}>
               <input
@@ -2422,11 +2430,18 @@ export function LuxUI() {
       .catch(() => fetch(STATIC).then(r => r.json()).then(applyResponse).catch(() => {}));
   }, []);
 
-  // ── Detect Telegram context (no auto-login — user must press button) ─
+  // ── Detect Telegram WebApp context + expand viewport ──────────────
   useEffect(() => {
     const tg = (window as any).Telegram?.WebApp;
     if (!tg) return;
-    tg.ready();
+    try {
+      tg.ready();
+      tg.expand?.();
+      // Theme the Telegram chrome to match the app's dark background so the
+      // status-bar / header don't show as a stark light strip.
+      tg.setHeaderColor?.("#000000");
+      tg.setBackgroundColor?.("#000000");
+    } catch { /* older Telegram clients */ }
     const user: TgUser | undefined = tg.initDataUnsafe?.user;
     if (user?.id) setTgUser(user);
   }, []);
@@ -2444,6 +2459,17 @@ export function LuxUI() {
       setLoginError("Backend unavailable. Try again.");
     }
   }
+
+  // ── Auto-login when running inside a Telegram Mini App ──────────
+  // initDataUnsafe.user is populated by Telegram for every Mini App launch,
+  // so the player should never see the AuthScreen inside Telegram — we log
+  // them in straight away with their real Telegram ID.
+  useEffect(() => {
+    if (authed) return;
+    if (!tgUser?.id) return;
+    handleLogin(String(tgUser.id));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tgUser?.id, authed]);
 
   // ── Shared score+lastDaily updater ─────────────────────────────
   function handleScoreUpdate(score: number, lastDailyReward?: string | null) {
@@ -2474,14 +2500,20 @@ export function LuxUI() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, authed]);
 
+  // Responsive: on mobile (narrow viewport) or inside Telegram Mini App,
+  // fill the whole viewport without the desktop phone-mockup frame. The
+  // 390×780 framed mode is only used on wide desktop screens.
+  const isCompact = useIsCompactViewport(!!tgUser);
+  const frameStyle: React.CSSProperties = isCompact
+    ? { width: "100vw", height: "100dvh", maxWidth: "100vw", maxHeight: "100dvh", borderRadius: 0, border: "none", boxShadow: "none", overflow: "hidden", position: "relative" }
+    : { width: 390, height: 780, borderRadius: 44, overflow: "hidden", position: "relative", border: "1.5px solid rgba(0,212,255,0.2)", boxShadow: "0 0 0 1px rgba(0,0,0,0.8), 0 0 60px rgba(0,212,255,0.15), 0 0 120px rgba(124,58,237,0.1), 0 40px 80px rgba(0,0,0,0.8)" };
+  const rootStyle: React.CSSProperties = isCompact
+    ? { width: "100vw", height: "100dvh", background: "#000", display: "flex", justifyContent: "center", alignItems: "stretch" }
+    : { width: "100vw", height: "100vh", background: "#000", display: "flex", justifyContent: "center", alignItems: "center" };
+
   return (
-    <div className="lux-root" style={{ width: "100vw", height: "100vh", background: "#000", display: "flex", justifyContent: "center", alignItems: "center" }}>
-      <div style={{
-        width: 390, height: 780,
-        borderRadius: 44, overflow: "hidden", position: "relative",
-        border: "1.5px solid rgba(0,212,255,0.2)",
-        boxShadow: "0 0 0 1px rgba(0,0,0,0.8), 0 0 60px rgba(0,212,255,0.15), 0 0 120px rgba(124,58,237,0.1), 0 40px 80px rgba(0,0,0,0.8)",
-      }}>
+    <div className="lux-root" style={rootStyle}>
+      <div style={frameStyle}>
         <LuxBg />
         <div style={{ position: "relative", zIndex: 10, height: "100%", display: "flex", flexDirection: "column" }}>
           {!authed ? (
