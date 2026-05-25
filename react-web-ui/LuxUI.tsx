@@ -286,7 +286,7 @@ declare global {
   }
 }
 
-const TG_BOT_USERNAME = "LUX_Clicker_bot";
+const TG_BOT_USERNAME: string = import.meta.env.VITE_TELEGRAM_BOT_NAME ?? "LUX_Clicker_bot";
 
 function AuthScreen({
   onLogin, config, tgUser, loginError,
@@ -2044,7 +2044,7 @@ function ReferralsModal({
     setCode("");
   }
 
-  const tgLink = info?.code ? `https://t.me/LUX_Clicker_bot?start=${info.code}` : "";
+  const tgLink = info?.code ? `https://t.me/${TG_BOT_USERNAME}?start=${info.code}` : "";
 
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 50, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} onClick={onClose}>
@@ -2299,7 +2299,7 @@ function ProfileScreen({
         <div style={{ width: 80, height: 80, borderRadius: "50%", background: "radial-gradient(circle at 40% 35%, rgba(0,212,255,0.6) 0%, rgba(100,40,200,0.8) 60%, rgba(10,0,40,0.95) 100%)", border: "2px solid rgba(0,212,255,0.4)", boxShadow: "0 0 30px rgba(0,212,255,0.35)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 36, marginBottom: 10 }}>👤</div>
         <p style={{ fontSize: 20, fontWeight: 800, color: "#00d4ff", textShadow: "0 0 12px #00d4ff88" }}>{displayName}</p>
         <p style={{ fontSize: 11, color: "rgba(255,255,255,0.2)", marginTop: 2 }}>
-          {tgUser?.id ? `Telegram ID: ${tgUser.id}` : "Telegram · @LUX_Clicker_bot"}
+          {tgUser?.id ? `Telegram ID: ${tgUser.id}` : `Telegram · @${TG_BOT_USERNAME}`}
         </p>
       </div>
 
